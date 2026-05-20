@@ -46,14 +46,12 @@ class UserManager(BaseUserManager):
     def create_user(
         self, email, password, name, role, status, library_id, **extra_fields
     ):
-        """Creates and saves a regular user."""
         if not email:
             raise ValueError("An email address is required.")
         if not password:
             raise ValueError("A password is required.")
 
-        email = self.normalize_email(email)  # lowercases the domain part
-
+        email = self.normalize_email(email)
         user = self.model(
             email=email,
             name=name,
@@ -62,13 +60,26 @@ class UserManager(BaseUserManager):
             library_id=library_id,
             **extra_fields,
         )
-
-        # set_password() hashes the password using Django's hasher (bcrypt/PBKDF2).
-        # It stores the result in `password` which maps to `password_hash` in the DB
-        # via the db_column attribute defined on the field below.
         user.set_password(password)
         user.save(using=self._db)
         return user
+
+    def create_superuser(
+        self, email, password, name, library_id, role="admin", **extra_fields
+    ):
+        """
+        Called by `python manage.py createsuperuser`.
+        Forces role=admin and status=active regardless of what is passed in.
+        """
+        return self.create_user(
+            email=email,
+            password=password,
+            name=name,
+            role="admin",
+            status="active",
+            library_id=library_id,
+            **extra_fields,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +153,30 @@ class User(AbstractBaseUser):
 
     @property
     def is_active(self):
-        """A user is considered active if their status is 'active'."""
         return self.status == UserStatus.ACTIVE
 
     @property
     def is_admin(self):
         return self.role == UserRole.ADMIN
+
+    # --- Django admin requirements ---
+    # The admin panel checks these two properties before allowing login.
+    # We map them to our role system rather than adding separate DB columns.
+
+    @property
+    def is_staff(self):
+        # Any admin or librarian can access the Django admin panel.
+        return self.role in [UserRole.ADMIN, UserRole.LIBRARIAN]
+
+    @property
+    def is_superuser(self):
+        # Only admins get full unrestricted access in the admin panel.
+        return self.role == UserRole.ADMIN
+
+    # Django admin calls this when checking object-level permissions.
+    # Returning True for superusers gives admins full access to all models.
+    def has_perm(self, perm, obj=None):
+        return self.is_superuser
+
+    def has_module_perms(self, app_label):
+        return self.is_superuser

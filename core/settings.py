@@ -77,12 +77,12 @@ ALLOWED_HOSTS = os.environ.get(
 # one concern. You register every app here so Django knows about it.
 INSTALLED_APPS = [
     # --- Django built-in apps ---
-    # "django.contrib.admin",          # The /admin UI
+    "django.contrib.admin",  # The /admin UI
     "django.contrib.auth",  # Built-in auth framework (users, permissions)
     "django.contrib.contenttypes",  # Generic FK support used by admin & permissions
-    # "django.contrib.sessions",       # Session engine
-    # "django.contrib.messages",       # One-time flash messages
-    # "django.contrib.staticfiles",    # Static file serving
+    "django.contrib.sessions",  # Session engine
+    "django.contrib.messages",  # One-time flash messages
+    "django.contrib.staticfiles",  # Static file serving
     # --- Third-party packages ---
     "rest_framework",  # Django REST Framework — turns Django into an API server
     "rest_framework_simplejwt",  # JWT authentication support
@@ -101,11 +101,11 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",  # Must be FIRST — adds CORS headers
     "django.middleware.security.SecurityMiddleware",
-    # "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
-    # "django.contrib.auth.middleware.AuthenticationMiddleware",
-    # "django.contrib.messages.middleware.MessageMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
