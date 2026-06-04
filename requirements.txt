@@ -1,9 +1,16 @@
 asgiref==3.11.1
+certifi==2026.5.20
+charset-normalizer==3.4.7
 Django==6.0.5
 django-cors-headers==4.9.0
 djangorestframework==3.17.1
 djangorestframework_simplejwt==5.5.1
+idna==3.18
 psycopg2-binary==2.9.12
 PyJWT==2.12.1
 python-dotenv==1.2.2
+requests==2.34.2
+resend==2.30.1
 sqlparse==0.5.5
+typing_extensions==4.15.0
+urllib3==2.7.0

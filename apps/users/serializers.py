@@ -31,6 +31,9 @@ class UserCreateSerializer(serializers.ModelSerializer):
         ]
         # user_id is auto-generated — clients cannot set it
         read_only_fields = ["user_id"]
+        extra_kwargs = {
+            "password": {"write_only": True},  # double-enforced — never leaks
+        }
 
     def validate_email(self, value):
         """Reject duplicate emails with a clear error message."""
@@ -163,3 +166,47 @@ class UserResponseSerializer(serializers.ModelSerializer):
         ]
         # All fields are read-only here — this serializer is only used for output.
         read_only_fields = fields
+
+
+# ---------------------------------------------------------------------------
+# PASSWORD RESET REQUEST SERIALIZER
+# ---------------------------------------------------------------------------
+# Validates the email submitted on the "forgot password" form.
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        return value.lower().strip()
+
+
+# ---------------------------------------------------------------------------
+# PASSWORD RESET CONFIRM SERIALIZER
+# ---------------------------------------------------------------------------
+# Validates the uid, token, and new password submitted on the reset form.
+class PasswordResetConfirmSerializer(serializers.Serializer):
+
+    uid = serializers.UUIDField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(
+        write_only=True,
+        min_length=8,
+        validators=[validate_password],
+    )
+    confirm_password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        if attrs["new_password"] != attrs["confirm_password"]:
+            raise serializers.ValidationError(
+                {"confirm_password": "Passwords do not match."}
+            )
+        return attrs
+
+
+# ---------------------------------------------------------------------------
+# EMAIL ACTIVATION SERIALIZER
+# ---------------------------------------------------------------------------
+# Validates the uid and token submitted by the frontend after the user
+# clicks the activation link in their welcome email.
+class EmailActivationSerializer(serializers.Serializer):
+    uid = serializers.UUIDField()
+    token = serializers.CharField()

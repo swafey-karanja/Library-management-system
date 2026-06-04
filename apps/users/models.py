@@ -1,6 +1,7 @@
 import uuid
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
 from django.db import models
+from django.utils import timezone
 
 
 # ---------------------------------------------------------------------------
@@ -180,3 +181,81 @@ class User(AbstractBaseUser):
 
     def has_module_perms(self, app_label):
         return self.is_superuser
+
+
+# ---------------------------------------------------------------------------
+# PASSWORD RESET TOKEN
+# ---------------------------------------------------------------------------
+# Django manages this table — it doesn't exist in your original schema.
+# Run `python manage.py makemigrations && python manage.py migrate` after
+# adding this model.
+#
+# We store a hashed version of the token (not the raw token) for the same
+# reason passwords are hashed: if the DB is compromised, raw tokens can't
+# be used to reset accounts.
+class PasswordResetToken(models.Model):
+
+    # Each token row belongs to one user. Deleting the user cleans up tokens.
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="password_reset_tokens",
+        to_field="user_id",
+        db_column="user_id",
+    )
+
+    # The raw token is generated as a UUID and sent in the email link.
+    # We only store the hashed version here.
+    token_hash = models.CharField(max_length=255, unique=True)
+
+    # Tokens expire after 1 hour. Checked on use.
+    expires_at = models.DateTimeField()
+
+    # Once used, this flips to True so the token can't be reused even if
+    # it hasn't expired yet.
+    is_used = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        # Django manages this table — it will be created via migration.
+        db_table = "password_reset_tokens"
+
+    def is_valid(self):
+        """Returns True only if the token hasn't been used and hasn't expired."""
+        return not self.is_used and self.expires_at > timezone.now()
+
+
+# ---------------------------------------------------------------------------
+# EMAIL ACTIVATION TOKEN
+# ---------------------------------------------------------------------------
+# Generated when a new user is created. The user must click the activation
+# link in their welcome email to flip their status from inactive → active.
+# Kept separate from PasswordResetToken — they serve different purposes
+# and have different expiry windows.
+class EmailActivationToken(models.Model):
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="activation_tokens",
+        to_field="user_id",
+        db_column="user_id",
+    )
+
+    # SHA-256 hash of the raw token sent in the email link.
+    token_hash = models.CharField(max_length=255, unique=True)
+
+    # Activation links are valid for 24 hours — longer than password reset
+    # since the user may not check their email immediately.
+    expires_at = models.DateTimeField()
+
+    is_used = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "email_activation_tokens"
+
+    def is_valid(self):
+        return not self.is_used and self.expires_at > timezone.now()

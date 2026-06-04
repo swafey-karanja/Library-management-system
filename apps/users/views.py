@@ -1,4 +1,9 @@
 import logging
+import uuid
+import hashlib
+
+from django.utils import timezone
+from datetime import timedelta
 
 from rest_framework import status
 from rest_framework.views import APIView
@@ -6,18 +11,25 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import User
+from .models import User, PasswordResetToken, EmailActivationToken, UserStatus
 from .serializers import (
     UserCreateSerializer,
     UserUpdateSerializer,
     UserResponseSerializer,
     ChangePasswordSerializer,
+    PasswordResetRequestSerializer,
+    PasswordResetConfirmSerializer,
+    EmailActivationSerializer,
 )
 from .permissions import (
     IsAdminOrLibrarian,
     IsSameUserOrAdmin,
     IsSameUserOrAdminOrLibrarian,
 )
+
+from .emails import send_password_reset_email, send_activation_email
+
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
@@ -63,6 +75,7 @@ class UserListCreateView(APIView):
         serializer = UserCreateSerializer(data=data)
         if serializer.is_valid():
             user = serializer.save()
+            _send_activation(user)
             return Response(
                 UserResponseSerializer(user).data,
                 status=status.HTTP_201_CREATED,
@@ -195,8 +208,8 @@ class LoginView(APIView):
         email = request.data.get("email", "").lower().strip()
         password = request.data.get("password", "")
 
-        print("Email:", email)
-        print("Password:", password)
+        # print("Email:", email)
+        # print("Password:", password)
 
         if not email or not password:
             return Response(
@@ -281,4 +294,276 @@ class MeView(APIView):
     def get(self, request):
         return Response(
             UserResponseSerializer(request.user).data, status=status.HTTP_200_OK
+        )
+
+
+# ---------------------------------------------------------------------------
+# PASSWORD RESET REQUEST
+# POST /api/v1/users/password-reset/
+#
+# Step 1 of the flow: user submits their email address.
+# We always return the same 200 response whether the email exists or not —
+# this prevents attackers from using this endpoint to discover registered emails.
+# ---------------------------------------------------------------------------
+class PasswordResetRequestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        email = serializer.validated_data["email"]
+
+        # Generic response sent regardless of whether the user exists.
+        generic_response = Response(
+            {"detail": "If that email is registered, a reset link has been sent."},
+            status=status.HTTP_200_OK,
+        )
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            # Return the same response so we don't leak whether the email is registered.
+            return generic_response
+
+        if not user.is_active:
+            # Don't reveal that the account is inactive either.
+            return generic_response
+
+        # --- Generate a secure random token ---
+        # uuid4() gives us a cryptographically random 128-bit value.
+        raw_token = str(uuid.uuid4())
+
+        # Hash the token before storing it — same principle as password hashing.
+        # If the DB is leaked, stored hashes can't be used directly.
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        # Invalidate any existing unused tokens for this user so only one
+        # active reset link exists at a time.
+        PasswordResetToken.objects.filter(user=user, is_used=False).update(is_used=True)
+
+        # Store the new token, expiring 1 hour from now.
+        PasswordResetToken.objects.create(
+            user=user,
+            token_hash=token_hash,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        # Build the reset URL the frontend will handle.
+        # uid identifies the user; token authenticates the request.
+        # The frontend reads these from the URL and POSTs them to /password-reset/confirm/.
+        frontend_url = settings.FRONTEND_URL.rstrip("/")
+        reset_url = (
+            f"{frontend_url}/reset-password"
+            f"?uid={user.user_id}"
+            f"&token={raw_token}"
+        )
+
+        send_password_reset_email(
+            user_name=user.name,
+            to_email=user.email,
+            reset_url=reset_url,
+        )
+
+        return generic_response
+
+
+# ---------------------------------------------------------------------------
+# PASSWORD RESET CONFIRM
+# POST /api/v1/users/password-reset/confirm/
+#
+# Step 2 of the flow: user submits uid + token from the email link
+# plus their new password (entered twice on the reset form).
+# ---------------------------------------------------------------------------
+class PasswordResetConfirmView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        uid = serializer.validated_data["uid"]
+        raw_token = serializer.validated_data["token"]
+        new_password = serializer.validated_data["new_password"]
+
+        # --- Look up the user ---
+        try:
+            user = User.objects.get(pk=uid)
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "Invalid or expired reset link."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --- Look up the token by hashing the submitted raw token ---
+        # We never store the raw token, so we hash it and compare against
+        # what's in the DB — same approach as verifying a hashed password.
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        try:
+            reset_token = PasswordResetToken.objects.get(
+                user=user,
+                token_hash=token_hash,
+            )
+        except PasswordResetToken.DoesNotExist:
+            return Response(
+                {"detail": "Invalid or expired reset link."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --- Validate the token ---
+        if not reset_token.is_valid():
+            return Response(
+                {"detail": "This reset link has expired or has already been used."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --- Apply the new password ---
+        user.set_password(new_password)
+        user.save(update_fields=["password"])
+
+        # Mark the token as used so it can't be replayed.
+        reset_token.is_used = True
+        reset_token.save(update_fields=["is_used"])
+
+        return Response(
+            {"detail": "Password reset successfully. You can now log in."},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ---------------------------------------------------------------------------
+# HELPER — generates an activation token and fires the welcome email.
+# Extracted into a standalone function so it can be called from the
+# user create view without making that view too long.
+# ---------------------------------------------------------------------------
+def _send_activation(user, request=None):
+    """
+    Creates an EmailActivationToken for the given user and sends the
+    welcome / activation email via Resend.
+    """
+    raw_token = str(uuid.uuid4())
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+    # Invalidate any pre-existing unused tokens for this user first.
+    EmailActivationToken.objects.filter(user=user, is_used=False).update(is_used=True)
+
+    EmailActivationToken.objects.create(
+        user=user,
+        token_hash=token_hash,
+        expires_at=timezone.now() + timedelta(hours=24),
+    )
+
+    frontend_url = settings.FRONTEND_URL.rstrip("/")
+    activation_url = (
+        f"{frontend_url}/activate" f"?uid={user.user_id}" f"&token={raw_token}"
+    )
+
+    send_activation_email(
+        user_name=user.name,
+        to_email=user.email,
+        activation_url=activation_url,
+    )
+
+
+# ---------------------------------------------------------------------------
+# EMAIL ACTIVATION
+# POST /api/v1/users/activate/
+#
+# Called by the frontend immediately after the user clicks the link in
+# their welcome email. No authentication required — the uid + token pair
+# is the proof of identity.
+# ---------------------------------------------------------------------------
+class EmailActivationView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = EmailActivationSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        uid = serializer.validated_data["uid"]
+        raw_token = serializer.validated_data["token"]
+
+        # Look up the user.
+        try:
+            user = User.objects.get(pk=uid)
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "Invalid activation link."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # If the user is already active the link was clicked more than once.
+        if user.status == UserStatus.ACTIVE:
+            return Response(
+                {"detail": "This account has already been activated."},
+                status=status.HTTP_200_OK,
+            )
+
+        # Hash the submitted token and look it up.
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        try:
+            activation_token = EmailActivationToken.objects.get(
+                user=user,
+                token_hash=token_hash,
+            )
+        except EmailActivationToken.DoesNotExist:
+            return Response(
+                {"detail": "Invalid activation link."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not activation_token.is_valid():
+            return Response(
+                {
+                    "detail": "This activation link has expired. Contact your administrator to resend it."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Activate the account and invalidate the token.
+        user.status = UserStatus.ACTIVE
+        user.save(update_fields=["status"])
+
+        activation_token.is_used = True
+        activation_token.save(update_fields=["is_used"])
+
+        return Response(
+            {"detail": "Account activated successfully. You can now log in."},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ---------------------------------------------------------------------------
+# RESEND ACTIVATION EMAIL
+# POST /api/v1/users/<user_id>/resend-activation/
+#
+# Admin or librarian can trigger a fresh activation email if the original
+# link expired before the user clicked it.
+# ---------------------------------------------------------------------------
+class ResendActivationView(APIView):
+    permission_classes = [IsAdminOrLibrarian]
+
+    def post(self, request, user_id):
+        user = get_user_or_404(user_id)
+        if not user:
+            return Response(
+                {"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        if user.status == UserStatus.ACTIVE:
+            return Response(
+                {"detail": "This account is already active."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        _send_activation(user)
+
+        return Response(
+            {"detail": "Activation email resent successfully."},
+            status=status.HTTP_200_OK,
         )

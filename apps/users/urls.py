@@ -6,6 +6,9 @@ from .views import (
     LoginView,
     LogoutView,
     MeView,
+    PasswordResetRequestView,
+    PasswordResetConfirmView,
+    EmailActivationView,
 )
 
 # All paths here are relative to the prefix set in core/urls.py → 'api/v1/users/'
@@ -24,4 +27,16 @@ urlpatterns = [
         ChangePasswordView.as_view(),
         name="user-change-password",
     ),
+    # Password reset (unauthenticated — for locked-out users)
+    path(
+        "password-reset/",
+        PasswordResetRequestView.as_view(),
+        name="password-reset-request",
+    ),
+    path(
+        "password-reset/confirm/",
+        PasswordResetConfirmView.as_view(),
+        name="password-reset-confirm",
+    ),
+    path("activate/", EmailActivationView.as_view(), name="email-activation"),
 ]

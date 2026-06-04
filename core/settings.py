@@ -268,3 +268,13 @@ CORS_ALLOW_CREDENTIALS = True
 # keys and has a library_id foreign key — things Django's default model
 # doesn't have.
 AUTH_USER_MODEL = "users.User"
+
+
+# ---------------------------------------------------------------------------
+# RESEND EMAIL SERVICE
+# ---------------------------------------------------------------------------
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "noreply@swafey.top")
+
+# Base URL of the frontend app — used to build the reset link in emails.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
