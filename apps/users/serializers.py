@@ -51,11 +51,10 @@ class UserCreateSerializer(serializers.ModelSerializer):
         return value
 
     def validate_status(self, value):
-        """Ensure status is one of the defined choices."""
-        valid_statuses = [s[0] for s in UserStatus.CHOICES]
-        if value not in valid_statuses:
+        if value != UserStatus.INACTIVE:
             raise serializers.ValidationError(
-                f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
+                "New users must be created with a status of 'inactive'. "
+                "Their status will be changed to 'active' once they confirm their email address."
             )
         return value
 
@@ -67,7 +66,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         """
         password = validated_data.pop("password")
 
-        user = User.objects.create_user(
+        user = User.objects.create_user(  # type: ignore
             password=password,
             **validated_data,
         )
@@ -162,7 +161,6 @@ class UserResponseSerializer(serializers.ModelSerializer):
             "email",
             "role",
             "status",
-            "created_at",
         ]
         # All fields are read-only here — this serializer is only used for output.
         read_only_fields = fields

@@ -1,9 +1,5 @@
-import logging
 import uuid
 import hashlib
-
-from django.utils import timezone
-from datetime import timedelta
 
 from rest_framework import status
 from rest_framework.views import APIView
@@ -11,7 +7,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import User, PasswordResetToken, EmailActivationToken, UserStatus
+from .models import User, UserStatus, PasswordResetToken, EmailActivationToken
 from .serializers import (
     UserCreateSerializer,
     UserUpdateSerializer,
@@ -22,16 +18,18 @@ from .serializers import (
     EmailActivationSerializer,
 )
 from .permissions import (
+    # IsAdminUser,
     IsAdminOrLibrarian,
     IsSameUserOrAdmin,
     IsSameUserOrAdminOrLibrarian,
 )
 
-from .emails import send_password_reset_email, send_activation_email
+from django.utils import timezone
+from datetime import timedelta
 
+from .emails import send_password_reset_email, send_activation_email
 from django.conf import settings
 
-logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # HELPER
 # ---------------------------------------------------------------------------
@@ -65,9 +63,10 @@ class UserListCreateView(APIView):
 
     def post(self, request):
         """
-        Create a new user.
-        library_id is injected from the authenticated user's own library_id
-        so a librarian can only ever create users within their own library.
+        Create a new user. Status is forced to inactive by the serializer.
+        An activation email is sent immediately after the record is saved.
+        library_id is injected from the authenticated user so a librarian
+        can only ever create users within their own library.
         """
         data = request.data.copy()
         data.setdefault("library_id", str(request.user.library_id))
@@ -186,7 +185,7 @@ class ChangePasswordView(APIView):
             data=request.data, context={"request": request}
         )
         if serializer.is_valid():
-            user.set_password(serializer.validated_data["new_password"])
+            user.set_password(serializer.validated_data["new_password"])  # type: ignore
             user.save(update_fields=["password"])
             return Response(
                 {"detail": "Password updated successfully."},
@@ -207,9 +206,6 @@ class LoginView(APIView):
     def post(self, request):
         email = request.data.get("email", "").lower().strip()
         password = request.data.get("password", "")
-
-        # print("Email:", email)
-        # print("Password:", password)
 
         if not email or not password:
             return Response(
@@ -313,7 +309,7 @@ class PasswordResetRequestView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        email = serializer.validated_data["email"]
+        email = serializer.validated_data["email"]  # type: ignore
 
         # Generic response sent regardless of whether the user exists.
         generic_response = Response(
@@ -384,9 +380,9 @@ class PasswordResetConfirmView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        uid = serializer.validated_data["uid"]
-        raw_token = serializer.validated_data["token"]
-        new_password = serializer.validated_data["new_password"]
+        uid = serializer.validated_data["uid"]  # type: ignore
+        raw_token = serializer.validated_data["token"]  # type: ignore
+        new_password = serializer.validated_data["new_password"]  # type: ignore
 
         # --- Look up the user ---
         try:
@@ -484,8 +480,8 @@ class EmailActivationView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        uid = serializer.validated_data["uid"]
-        raw_token = serializer.validated_data["token"]
+        uid = serializer.validated_data["uid"]  # type: ignore
+        raw_token = serializer.validated_data["token"]  # type: ignore
 
         # Look up the user.
         try:

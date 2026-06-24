@@ -129,14 +129,14 @@ class User(AbstractBaseUser):
     # so it doesn't require a value, but we don't use it for anything.
     last_login = models.DateTimeField(null=True, blank=True)
 
+    # Attach our custom manager so User.objects.create_user() works correctly.
+    objects = UserManager()
+
     # Tells Django which field is used as the username for authentication.
     USERNAME_FIELD = "email"
 
     # Fields prompted when running `createsuperuser` (besides email + password).
     REQUIRED_FIELDS = ["name", "library_id", "role"]
-
-    # Attach our custom manager so User.objects.create_user() works correctly.
-    objects = UserManager()
 
     class Meta:
         managed = False  # PostgreSQL table already exists — Django won't alter it
@@ -153,7 +153,7 @@ class User(AbstractBaseUser):
     # and other permission classes that inspect the user object.
 
     @property
-    def is_active(self):
+    def is_active(self):  # type: ignore
         return self.status == UserStatus.ACTIVE
 
     @property
