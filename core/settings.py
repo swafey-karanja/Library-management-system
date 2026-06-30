@@ -29,7 +29,8 @@ DATA FLOW OVERVIEW:
 from pathlib import Path
 from datetime import timedelta
 import os
-import sys
+
+# import sys
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -41,7 +42,7 @@ from dotenv import load_dotenv
 # We use BASE_DIR to build absolute paths to other files/folders.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-sys.path.insert(0, os.path.join(BASE_DIR, "apps"))
+# sys.path.insert(0, os.path.join(BASE_DIR, "apps"))
 # ---------------------------------------------------------------------------
 # ENVIRONMENT VARIABLES
 # ---------------------------------------------------------------------------
@@ -89,8 +90,12 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt.token_blacklist",
     "corsheaders",  # Handles Cross-Origin Resource Sharing for the frontend
     # --- Our own apps (one per module) ---
+    # ---------------------------------------------------------------------------
+    # MODULES
+    # ---------------------------------------------------------------------------
     # Each app lives in its own folder inside the project root.
     "apps.users",  # User management (this is the first module we build)
+    "apps.libraries",  # Library managment
 ]
 
 # ---------------------------------------------------------------------------
@@ -164,6 +169,12 @@ DATABASES = {
         "PASSWORD": os.environ.get("DB_PASSWORD", "admin"),
         "HOST": os.environ.get("DB_HOST", "localhost"),
         "PORT": os.environ.get("DB_PORT", "5432"),
+        "TEST": {
+            "NAME": os.environ.get(
+                "DB_NAME", "library_db"
+            ),  # reuse the real DB instead of creating a fresh test DB
+            "KEEPDB": True,
+        },
     }
 }
 

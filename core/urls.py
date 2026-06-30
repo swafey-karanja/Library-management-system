@@ -31,10 +31,15 @@ from rest_framework_simplejwt.views import (
 )
 
 urlpatterns = [
+    # Admin dashboard
     path("admin/", admin.site.urls),
+    # Auth Tokens
     path("api/v1/auth/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
     path(
         "api/v1/auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"
     ),
+    # Users
     path("api/v1/users/", include("apps.users.urls")),
+    # Libraries
+    path("api/libraries/", include("apps.libraries.urls")),
 ]
