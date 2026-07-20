@@ -23,17 +23,36 @@ class Library(models.Model):
         primary_color VARCHAR(20)
         secondary_color VARCHAR(20)
         enabled_modules JSONB
+        status VARCHAR(20) NOT NULL DEFAULT 'active'
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     """
 
+    # --- Status choices ---
+    # Defining allowed values as class-level constants rather than bare
+    # strings serves two purposes:
+    #   1. Django uses them to validate incoming data at the model/form
+    #      level (in addition to the CHECK constraint in Postgres).
+    #   2. They give us a single source of truth — if we ever need to
+    #      reference these values elsewhere in code (e.g. filtering only
+    #      active libraries), we write Library.Status.ACTIVE rather than
+    #      the raw string "active", which makes typos impossible and
+    #      refactoring easier.
+    class Status(models.TextChoices):
+        # TextChoices generates a tuple of (db_value, human_readable_label)
+        # for each member. ACTIVE produces ("active", "Active") and
+        # INACTIVE produces ("inactive", "Inactive"). Django stores the
+        # db_value in the database and uses the label in admin/forms.
+        ACTIVE = "active", "Active"
+        INACTIVE = "inactive", "Inactive"
+
     # --- Primary Key ---
-    # Postgres generates this UUID for us via `gen_random_uuid()` (pgcrypto
-    # extension), so on the Django side we mark editable=False and don't
-    # provide a default — we let the database handle ID generation.
-    # We still declare it as a UUIDField so Django reads/writes UUID values
-    # correctly when querying or serializing.
+    # default=uuid.uuid4 generates a UUID on the Python side the moment
+    # a new Library instance is created, before any SQL is sent. This is
+    # necessary because managed=False means Django can't rely on the
+    # database's DEFAULT gen_random_uuid() being triggered through the ORM.
     library_id = models.UUIDField(
         primary_key=True,
+        default=uuid.uuid4,
         editable=False,
     )
 
@@ -48,10 +67,6 @@ class Library(models.Model):
         help_text="The display name of the library. Must be unique across the system.",
     )
 
-    # logo, url, primary_color, secondary_color are all optional in SQL
-    # (no NOT NULL constraint), so we set null=True so Django allows NULL
-    # in the database, and blank=True so forms/serializers don't require
-    # a value either.
     logo = models.CharField(
         max_length=500,
         null=True,
@@ -84,9 +99,6 @@ class Library(models.Model):
     # --- JSON field ---
     # Maps to the JSONB column in Postgres. Django's JSONField handles the
     # conversion between Python dicts/lists and JSON automatically.
-    # default=dict means a new Library instance starts with an empty JSON
-    # object ({}) rather than NULL, which is usually easier to work with
-    # when checking "is module X enabled?" type logic later.
     enabled_modules = models.JSONField(
         null=True,
         blank=True,
@@ -94,38 +106,37 @@ class Library(models.Model):
         help_text="JSON object describing which system modules are enabled for this library.",
     )
 
+    # --- Status field ---
+    # Uses the Status choices class defined above. choices=Status.choices
+    # tells Django the only valid values are "active" and "inactive".
+    # default=Status.ACTIVE means every newly created library starts as
+    # active unless explicitly set otherwise — this mirrors the DEFAULT
+    # 'active' we added to the Postgres column via ALTER TABLE.
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.ACTIVE,
+        null=False,
+        blank=False,
+        help_text="Whether this library is currently active or inactive.",
+    )
+
     # --- Timestamps ---
     # auto_now_add=True makes Django set this automatically the moment the
     # row is created, mirroring the SQL `DEFAULT CURRENT_TIMESTAMP`.
-    # editable=False prevents this from showing up in forms.
     created_at = models.DateTimeField(
         auto_now_add=True,
         editable=False,
     )
 
     class Meta:
-        # This tells Django: "this model does not own this table" — no
-        # CREATE TABLE / ALTER TABLE / DROP TABLE will ever be generated
-        # for it via `makemigrations` / `migrate`.
         managed = False
-
-        # Explicitly point this model at the existing table name, since
-        # Django would otherwise default to "libraries_library" (based on
-        # app label + model name).
         db_table = "library"
-
-        # Optional, but nice for Django admin and shell readability.
         verbose_name = "Library"
         verbose_name_plural = "Libraries"
-
-        # Matches the SQL index `idx_library_name` — this doesn't create
-        # the index (managed=False handles that), it just documents intent
-        # and helps Django's query optimizer reasoning / admin tooling.
         indexes = [
             models.Index(fields=["name"], name="idx_library_name"),
         ]
 
     def __str__(self):
-        # This controls how a Library instance is displayed as a string —
-        # e.g. in the Django admin list view, or when printed in the shell.
         return self.name

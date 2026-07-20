@@ -30,6 +30,7 @@ class LibrarySerializer(serializers.ModelSerializer):
             "primary_color",
             "secondary_color",
             "enabled_modules",
+            "status",
             "created_at",
         ]
 
@@ -69,6 +70,55 @@ class LibrarySerializer(serializers.ModelSerializer):
         validated_data["library_id"] = uuid.uuid4()
         return Library.objects.create(**validated_data)
 
+    def update(self, instance, validated_data):
+        """
+        Overrides the default ModelSerializer.update() behaviour.
+
+        `instance` is the existing Library object fetched from the
+        database by the view (the one we're updating). `validated_data`
+        is the cleaned, validated data sent in the PUT or PATCH request
+        body — it will never contain library_id or created_at because
+        those are declared as read_only_fields above, so DRF strips them
+        out before validation even runs.
+
+        How PUT vs PATCH works here:
+        - PUT: the client sends ALL editable fields. validated_data will
+          contain every field (name, logo, url, primary_color,
+          secondary_color, enabled_modules). Any field the client omits
+          will fail validation since fields are required by default.
+        - PATCH: the client sends ONLY the fields they want to change.
+          validated_data will only contain those fields. Fields not
+          included are left untouched on the instance, because we use
+          validated_data.get(field, current_value) below.
+
+        The view controls which method is used — our UpdateAPIView
+        supports both PUT and PATCH automatically.
+        """
+        # For each editable field, update the instance's attribute with
+        # the new value if it was provided, or keep the existing value
+        # if it wasn't (this is what makes PATCH work correctly).
+        instance.name = validated_data.get("name", instance.name)
+        instance.logo = validated_data.get("logo", instance.logo)
+        instance.url = validated_data.get("url", instance.url)
+        instance.primary_color = validated_data.get(
+            "primary_color", instance.primary_color
+        )
+        instance.secondary_color = validated_data.get(
+            "secondary_color", instance.secondary_color
+        )
+        instance.enabled_modules = validated_data.get(
+            "enabled_modules", instance.enabled_modules
+        )
+
+        # Persist the changes to the database. Django's ORM generates an
+        # UPDATE SQL statement targeting the row with this instance's
+        # primary key (library_id).
+        instance.save()
+
+        # Return the updated instance so DRF can serialize it back to
+        # JSON for the response.
+        return instance
+
     def validate_name(self, value):
         """
         Field-level validation for `name`.
@@ -87,6 +137,22 @@ class LibrarySerializer(serializers.ModelSerializer):
                 "Library name cannot be empty or just whitespace."
             )
         return cleaned_value
+
+    def validate_status(self, value):
+        """
+        Validates that status is one of the allowed values defined in
+        Library.Status. Although DRF already enforces choices validation
+        automatically when choices are set on the model field, we add
+        this explicit validator to return a clear, descriptive error
+        message rather than the default generic one — making the API
+        easier to consume for front-end developers.
+        """
+        allowed = [choice[0] for choice in Library.Status.choices]
+        if value not in allowed:
+            raise serializers.ValidationError(
+                f"Invalid status '{value}'. Must be one of: {', '.join(allowed)}."
+            )
+        return value
 
     def validate_enabled_modules(self, value):
         """

@@ -47,6 +47,11 @@ class LibraryEndpointTests(APITestCase):
         below. We use it here to create one known Library record in the
         (test) database, which the list-endpoint test can check against.
         """
+        # Bypass JWT authentication for all requests made by this test
+        # client. force_authenticate() tells DRF to skip the auth check
+        # entirely, so we can test the view logic in isolation without
+        # needing to generate real tokens in every test.
+        self.client.force_authenticate(user=None)
         self.existing_library = Library.objects.create(
             name="Existing Test Library",
             url="https://existing-test-library.example.com",

@@ -1,5 +1,5 @@
 from rest_framework.permissions import BasePermission
-from .models import UserRole
+from ..apps.users.models import UserRole
 
 # ---------------------------------------------------------------------------
 # BASE HELPER
@@ -33,7 +33,9 @@ class IsAdminUser(BasePermission):
 
     message = "Admin role required."
 
-    def has_permission(self, request, view):
+    def has_permission(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, request, view
+    ) -> bool:
         return _is_authenticated(request) and request.user.role == UserRole.ADMIN
 
 
@@ -46,7 +48,9 @@ class IsAdminOrLibrarian(BasePermission):
 
     message = "Admin or Librarian role required."
 
-    def has_permission(self, request, view):
+    def has_permission(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, request, view
+    ) -> bool:
         return _is_authenticated(request) and request.user.role in [
             UserRole.ADMIN,
             UserRole.LIBRARIAN,
@@ -72,7 +76,9 @@ class IsSameUserOrAdmin(BasePermission):
 
     message = "You can only modify your own account."
 
-    def has_permission(self, request, view):
+    def has_permission(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, request, view
+    ) -> bool:
         return _is_authenticated(request)
 
     def has_object_permission(self, request, view, obj):
@@ -92,7 +98,9 @@ class IsSameUserOrAdminOrLibrarian(BasePermission):
 
     message = "You do not have permission to access this user record."
 
-    def has_permission(self, request, view):
+    def has_permission(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, request, view
+    ) -> bool:
         return _is_authenticated(request)
 
     def has_object_permission(self, request, view, obj):
