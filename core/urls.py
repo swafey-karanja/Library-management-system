@@ -42,4 +42,6 @@ urlpatterns = [
     path("api/v1/users/", include("apps.users.urls")),
     # Libraries
     path("api/libraries/", include("apps.libraries.urls")),
+    # Libraries
+    path("api/books/", include("apps.books.urls")),
 ]

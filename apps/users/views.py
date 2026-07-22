@@ -17,7 +17,7 @@ from .serializers import (
     PasswordResetConfirmSerializer,
     EmailActivationSerializer,
 )
-from ...core.permissions import (
+from core.permissions import (
     # IsAdminUser,
     IsAdminOrLibrarian,
     IsSameUserOrAdmin,

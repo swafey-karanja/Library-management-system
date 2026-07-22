@@ -1,5 +1,5 @@
 from rest_framework.permissions import BasePermission
-from ..apps.users.models import UserRole
+from apps.users.models import UserRole
 
 # ---------------------------------------------------------------------------
 # BASE HELPER

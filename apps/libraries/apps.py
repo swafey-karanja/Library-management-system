@@ -8,4 +8,4 @@ class LibrariesConfig(AppConfig):
     # INSTALLED_APPS loading and to determine the app_label for models.
     default_auto_field = "django.db.models.BigAutoField"
     name = "apps.libraries"
-    label = "books"
+    label = "libraries"

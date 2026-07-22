@@ -1,7 +1,7 @@
 from rest_framework import generics
 from .models import Library
 from .serializers import LibrarySerializer
-from ...core.permissions import (
+from core.permissions import (
     IsAdminUser,
     #  IsAdminOrLibrarian,
     #  IsSameUserOrAdmin,
