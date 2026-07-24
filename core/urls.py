@@ -44,4 +44,6 @@ urlpatterns = [
     path("api/libraries/", include("apps.libraries.urls")),
     # Libraries
     path("api/books/", include("apps.books.urls")),
+    # Members
+    path("api/members/", include("apps.members.urls")),
 ]

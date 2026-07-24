@@ -101,7 +101,13 @@ class User(AbstractBaseUser):
     # Foreign key to the library — stored as a plain UUID field because the
     # `library` table is not yet a Django model. We'll convert this to a
     # proper ForeignKey when we build the library module.
-    library_id = models.UUIDField(null=False)
+    library = models.ForeignKey(
+        "libraries.Library",
+        to_field="library_id",
+        db_column="library_id",
+        on_delete=models.CASCADE,
+        related_name="users",
+    )
 
     name = models.CharField(max_length=120)
     email = models.EmailField(max_length=255, unique=True)

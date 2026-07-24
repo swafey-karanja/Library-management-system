@@ -95,8 +95,9 @@ INSTALLED_APPS = [
     # ---------------------------------------------------------------------------
     # Each app lives in its own folder inside the project root.
     "apps.users",  # User management (this is the first module we build)
-    "apps.libraries",  # Library managment
+    "apps.libraries",  # Library management
     "apps.books",  # Books management
+    "apps.members", #Members app
 ]
 
 # ---------------------------------------------------------------------------
