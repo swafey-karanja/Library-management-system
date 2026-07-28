@@ -84,6 +84,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",  # Session engine
     "django.contrib.messages",  # One-time flash messages
     "django.contrib.staticfiles",  # Static file serving
+    "django_filters",
     # --- Third-party packages ---
     "rest_framework",  # Django REST Framework — turns Django into an API server
     "rest_framework_simplejwt",  # JWT authentication support

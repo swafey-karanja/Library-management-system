@@ -17,6 +17,8 @@ class MemberSerializer(serializers.ModelSerializer):
             "phone_number",
             "address",
             "status",
+            "gender",
+            "membership_type",
             "created_at",
         ]
         # member_id/created_at are server-generated. membership_no is

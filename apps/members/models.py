@@ -9,6 +9,33 @@ see the schema at the top of the project notes).
 import uuid
 from django.db import models
 
+class Gender:
+    MALE = "male"
+    FEMALE = "female"
+
+    CHOICES = [
+        (MALE, "Male"),
+        (FEMALE, "Female")
+    ]
+
+
+class MembershipType:
+    STUDENT = "student"
+    NORMAL = "normal"
+
+    CHOICES = [
+        (STUDENT, "Student"),
+        (NORMAL, "Normal"),
+    ]
+
+class Status:
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
+    CHOICES = [
+        (ACTIVE, "Active"),
+        (INACTIVE, "Inactive"),
+    ]
 
 class Member(models.Model):
     """
@@ -102,10 +129,28 @@ class Member(models.Model):
         db_column="address",
     )
 
+    gender = models.CharField(
+        max_length=10,
+        choices=Gender.CHOICES,
+        default=Gender.FEMALE,
+        db_column="gender",
+    )
+    membership_type = models.CharField(
+        max_length=10,
+        choices=MembershipType.CHOICES,
+        default=MembershipType.NORMAL,
+        db_column="membership_type",
+    )
+
     # --- Status flag ---
     # `status BOOLEAN DEFAULT TRUE`
     # Represents whether the membership is currently active. TRUE = active.
-    status = models.BooleanField(default=False, db_column="status")
+    status = models.CharField(
+        max_length=10,
+        choices=Status.CHOICES,
+        default=Status.ACTIVE,
+        db_column="status"
+    )
 
     # --- Timestamps ---
     # `created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
