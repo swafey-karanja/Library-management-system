@@ -7,6 +7,7 @@ from core.permissions import (
     #  IsSameUserOrAdmin,
     #  IsSameUserOrAdminOrLibrarian,
 )
+from core.search import filter_by_tokens
 
 
 class LibraryCreateView(generics.CreateAPIView):
@@ -53,9 +54,9 @@ class LibraryListView(generics.ListAPIView):
     permission_classes = [IsAdminUser]
     """
     API endpoint for listing all existing Library records.
-
     generics.ListAPIView handles GET requests and:
-        1. Fetches the queryset defined below (every Library row).
+        1. Fetches the queryset defined by get_queryset() below (every
+           Library row, optionally narrowed by a `?name=` search).
         2. Passes that queryset into the serializer with many=True
            (handled internally by DRF), which converts each Library
            instance into a JSON object.
@@ -64,23 +65,49 @@ class LibraryListView(generics.ListAPIView):
                    {"library_id": "...", "name": "Greenfield Library", ...},
                    {"library_id": "...", "name": "Riverside Library", ...}
                ]
-
     Note that we reuse the exact same LibrarySerializer used for creation.
     This works because the serializer's `fields` list already includes
     every field we want returned, and `read_only_fields` only affects
     what the client is allowed to SEND, not what gets returned when
     serializing existing data — so it's perfectly suited for both
     reading and writing.
-    """
 
-    # Defines the base queryset this view will return. .all() means every
-    # row in the library table, in whatever default order Postgres
-    # returns them (we can add explicit ordering later if needed, e.g.
-    # ordering by name or created_at).
-    queryset = Library.objects.all()
+    SEARCH: ?name=greenfield
+        Uses the same tokenized, punctuation/order-insensitive matching
+        as books/members/users search (see core/search.py) - e.g.
+        ?name=Green Library and ?name=Library, Green would both match a
+        library named "Greenfield Library". Omit the param to get every
+        library, unfiltered.
+    """
 
     # Reusing LibrarySerializer here, for the reasons explained above.
     serializer_class = LibrarySerializer
+
+    def get_queryset(self):
+        """
+        WHY THIS IS A METHOD INSTEAD OF A STATIC `queryset = ...`
+        CLASS ATTRIBUTE:
+            A class attribute like `queryset = Library.objects.all()` is
+            built ONCE, when Python first reads the class definition -
+            it has no way to see `self.request` at that point, because
+            no request exists yet. Search needs to read
+            `request.query_params` (i.e. what's after the `?` in the
+            URL), which is only available once an actual HTTP request
+            comes in. Overriding `get_queryset()` instead means DRF
+            calls this method FRESH on every single request, with
+            `self.request` already populated - giving us access to that
+            request's specific query params.
+        """
+        # .order_by("name") gives predictable, alphabetical results -
+        # without an explicit ordering, Postgres doesn't guarantee any
+        # particular row order across requests.
+        queryset = Library.objects.all().order_by("name")
+
+        name_query = self.request.query_params.get("name")
+        if name_query:
+            queryset = filter_by_tokens(queryset, "name", name_query)
+
+        return queryset
 
 
 class LibraryUpdateView(generics.UpdateAPIView):

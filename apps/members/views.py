@@ -9,7 +9,7 @@ from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Member, Status
+from .models import Member, Status, Gender, MembershipType
 from .serializers import MemberSerializer
 from .filters import MemberFilter
 from core.permissions import (
@@ -32,10 +32,10 @@ def scoped_members_for(user):
 
 
 class MemberPagination(PageNumberPagination):
-    """Caps every members list query at 100 rows per page."""
+    """Caps every members list query at 30 rows per page."""
 
-    page_size = 100
-    max_page_size = 100
+    page_size = 30
+    max_page_size = 30
 
 
 class MemberListView(generics.ListAPIView):
@@ -112,6 +112,68 @@ class MemberUpdateView(generics.UpdateAPIView):
     permission_classes = [IsAdminOrLibrarian]
     lookup_field = "member_id"
     lookup_url_kwarg = "member_id"
+
+
+class MemberBulkUpdateView(APIView):
+    """
+    PATCH /members/bulk-update/ -> update status, gender, and/or
+    membership_type on multiple members in one request. Only these
+    three "choice" columns are supported (not name, email, etc — bulk
+    editing free-text fields to the same value rarely makes sense).
+
+    Body:
+        {
+            "member_ids": ["uuid1", "uuid2", ...],
+            "status": "inactive",          # optional
+            "gender": "male",              # optional
+            "membership_type": "student"   # optional
+        }
+    At least one of status/gender/membership_type is required.
+
+    Isolation: uses scoped_members_for(), so member_ids belonging to
+    another library are silently excluded from the update rather than
+    erroring — this avoids leaking which IDs exist in other libraries.
+    """
+
+    permission_classes = [IsAdminOrLibrarian]
+
+    # Field name -> set of valid values, built from each model's choices.
+    ALLOWED_FIELDS = {
+        "status": {value for value, _ in Status.CHOICES},
+        "gender": {value for value, _ in Gender.CHOICES},
+        "membership_type": {value for value, _ in MembershipType.CHOICES},
+    }
+
+    def patch(self, request, *args, **kwargs):
+        member_ids = request.data.get("member_ids")
+        if not member_ids or not isinstance(member_ids, list):
+            return Response(
+                {"detail": "member_ids must be a non-empty list."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        updates = {}
+        for field, valid_values in self.ALLOWED_FIELDS.items():
+            if field not in request.data:
+                continue
+            value = request.data[field]
+            if value not in valid_values:
+                return Response(
+                    {"detail": f"Invalid value for {field}: {value!r}. Valid: {sorted(valid_values)}"},
+                    status=http_status.HTTP_400_BAD_REQUEST,
+                )
+            updates[field] = value
+
+        if not updates:
+            return Response(
+                {"detail": "Provide at least one of: status, gender, membership_type."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        queryset = scoped_members_for(request.user).filter(member_id__in=member_ids)
+        updated_count = queryset.update(**updates)
+
+        return Response({"updated_count": updated_count, "fields_updated": updates})
 
 
 class MemberStatisticsView(APIView):

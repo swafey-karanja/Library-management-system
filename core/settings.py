@@ -99,6 +99,7 @@ INSTALLED_APPS = [
     "apps.libraries",  # Library management
     "apps.books",  # Books management
     "apps.members", #Members app
+    "apps.book_copies", #Book copies app
 ]
 
 # ---------------------------------------------------------------------------

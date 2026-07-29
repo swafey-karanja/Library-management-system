@@ -24,6 +24,8 @@ from core.permissions import (
     IsSameUserOrAdminOrLibrarian,
 )
 
+from core.search import filter_by_tokens
+
 from django.utils import timezone
 from datetime import timedelta
 
@@ -50,14 +52,45 @@ def get_user_or_404(user_id):
 
 
 class UserListCreateView(APIView):
-
     def get_permissions(self):
         # Both GET and POST require admin or librarian — same class covers both.
         return [IsAdminOrLibrarian()]
 
     def get(self, request):
-        """Return all users belonging to the requester's library."""
-        users = User.objects.filter(library_id=request.user.library_id).order_by("name")
+        """
+        Return all users belonging to the requester's library.
+
+        Supports optional search via query params:
+            ?name=jane            -> only users whose name matches "jane"
+            ?email=doe             -> only users whose email matches "doe"
+            ?name=jane&email=doe   -> BOTH must match (combined with AND)
+
+        Both use the same tokenized, punctuation/order-insensitive
+        matching as the books and members search (see core/search.py) -
+        e.g. ?name=Doe, Jane and ?name=Jane Doe return the same users.
+
+        Omit both params entirely to get the full unfiltered list, same
+        as before.
+        """
+        users = User.objects.filter(library_id=request.user.library_id)
+
+        # request.query_params is a QueryDict (GET params) - .get()
+        # returns None if the param wasn't supplied at all, which is
+        # exactly the "not searching on this field" signal we want.
+        name_query = request.query_params.get("name")
+        email_query = request.query_params.get("email")
+
+        # Each call further narrows `users` - calling filter_by_tokens
+        # twice in a row (once per field) combines them with AND, same
+        # as chaining .filter() calls anywhere else in Django: a user
+        # must satisfy BOTH conditions if both params were supplied.
+        if name_query:
+            users = filter_by_tokens(users, "name", name_query)
+        if email_query:
+            users = filter_by_tokens(users, "email", email_query)
+
+        users = users.order_by("name")
+
         serializer = UserResponseSerializer(users, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -70,7 +103,6 @@ class UserListCreateView(APIView):
         """
         data = request.data.copy()
         data.setdefault("library_id", str(request.user.library_id))
-
         serializer = UserCreateSerializer(data=data)
         if serializer.is_valid():
             user = serializer.save()

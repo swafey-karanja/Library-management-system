@@ -161,3 +161,52 @@ class BookSerializer(serializers.ModelSerializer):
         # Return the updated instance so DRF can serialize it back to
         # JSON for the response.
         return instance
+
+
+class BookBulkUpdateSerializer(serializers.Serializer):
+    """
+    NOT a ModelSerializer - this doesn't represent a single Book, it
+    represents a REQUEST PAYLOAD shape: "update these specific books'
+    genre and/or publication_year". Plain `serializers.Serializer` is
+    the right tool whenever you're validating input that doesn't map
+    1-to-1 onto one model instance.
+
+    Expected request body:
+        {
+            "book_ids": ["<uuid>", "<uuid>", ...],
+            "genre": "Fantasy",            # optional
+            "publication_year": 2015       # optional
+        }
+
+    At least one of genre / publication_year must be supplied - only
+    setting book_ids with nothing to actually update wouldn't make
+    sense, so we enforce that in validate() below.
+    """
+
+    # ListField wraps another field and validates that the input is a
+    # list where EVERY item passes the inner field's validation - here,
+    # every item must be a valid UUID. `min_length=1` rejects an empty
+    # list, since there'd be nothing to update.
+    book_ids = serializers.ListField(
+        child=serializers.UUIDField(), min_length=1, allow_empty=False
+    )
+
+    # Both fields optional at this stage - we enforce "at least one
+    # provided" in validate() below, since that's a cross-field rule
+    # that a single field's own validation can't express.
+    genre = serializers.CharField(max_length=100, required=False)
+    publication_year = serializers.IntegerField(required=False)
+
+    def validate(self, data):
+        """
+        Object-level validation hook. Unlike `validate_<field_name>`
+        (which checks one field in isolation), this runs after all
+        individual fields have already passed their own checks, and
+        receives the full validated dict - letting us enforce rules
+        that depend on MULTIPLE fields at once.
+        """
+        if "genre" not in data and "publication_year" not in data:
+            raise serializers.ValidationError(
+                "Provide at least one of 'genre' or 'publication_year' to update."
+            )
+        return data
