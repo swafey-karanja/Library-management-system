@@ -227,3 +227,51 @@ class BookCopy(models.Model):
         # A barcode is the most human-recognizable identifier for a
         # single physical copy, so we use that instead of the raw UUID.
         return f'Copy {self.barcode} ({self.status})'
+
+        # ------------------------------------------------------------------
+        # AUTO-GENERATED BARCODE
+        # ------------------------------------------------------------------
+    def save(self, *args, **kwargs):
+        """
+        If no barcode was given, generate one from the book's ISBN-13
+        plus a sequence number (e.g. "9780134685991-0001"). An explicit
+        barcode is always left as-is.
+
+        Cost note: `self.book` is usually already cached from FK
+        validation in the serializer, so reading `self.book.isbn_13`
+        rarely triggers an extra query. The one genuine extra query is
+        the COUNT below (indexed on book_id, so cheap).
+        """
+        if not self.barcode:
+            self.barcode = self._generate_barcode()
+        super().save(*args, **kwargs)
+
+    def _generate_barcode(self):
+        """Builds "<prefix>-<sequence>", guaranteed unique."""
+        if not self.book_id:
+            raise ValueError('Cannot auto-generate a barcode without a related book.')
+
+        prefix = self._barcode_prefix()
+
+        # Sequence starts after however many copies of this book already exist.
+        existing_copies_of_this_book = BookCopy.objects.filter(book_id=self.book_id).count()
+        sequence_number = existing_copies_of_this_book + 1
+        candidate_barcode = f'{prefix}-{str(sequence_number).zfill(4)}'
+
+        # Rare-collision guard (e.g. gaps from deletions) — should basically never loop.
+        while BookCopy.objects.filter(barcode=candidate_barcode).exists():
+            sequence_number += 1
+            candidate_barcode = f'{prefix}-{str(sequence_number).zfill(4)}'
+
+        return candidate_barcode
+
+    def _barcode_prefix(self):
+        """ISBN-13 preferred, then ISBN-10, then a title slug. getattr()
+        keeps this safe if the books app's field names end up different."""
+        isbn = getattr(self.book, 'isbn_13', None) or getattr(self.book, 'isbn_10', None)
+        if isbn:
+            return str(isbn)
+
+        title = getattr(self.book, 'title', '') or 'BOOK'
+        slug = ''.join(character for character in title.upper() if character.isalnum())[:8]
+        return slug or 'BOOK'
