@@ -117,7 +117,11 @@ class BookCopyCreateSpecSerializer(serializers.Serializer):
     shelf_location = serializers.CharField(
         max_length=100, required=False, allow_blank=True, allow_null=True
     )
-    acquired_at = serializers.DateTimeField(required=False, allow_null=True)
+    acquired_at = serializers.DateTimeField(
+        required=False,
+        allow_null=True,
+        help_text="If not provided, will be auto-set to current timestamp"
+    )
 
     def validate(self, attrs):
         # A barcode identifies ONE physical copy — it can't be reused

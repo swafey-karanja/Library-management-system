@@ -136,6 +136,11 @@ class BookCopyCreateView(APIView):
                         'book': spec['book'].pk,
                         **shared_fields,
                     }
+                    # Only set acquired_at if provided, otherwise leave None for model save() to handle
+                    if 'acquired_at' in spec and spec['acquired_at'] is not None:
+                        copy_data['acquired_at'] = spec['acquired_at']
+                    # If not provided, don't include it - model's save() will set it
+
                     # Only reachable when quantity == 1 (validate() above
                     # rejects barcode + quantity > 1) — every other case
                     # leaves barcode out, so BookCopy.save() auto-generates it.

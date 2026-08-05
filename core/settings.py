@@ -247,7 +247,7 @@ REST_FRAMEWORK = {
 #   4. When the access token expires, frontend uses the refresh token to get a new one.
 #   5. When the refresh token expires, the user must log in again.
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),  # Access token valid for 1 hour
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=24),  # Access token valid for 1 hour
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),  # Refresh token valid for 7 days
     "ROTATE_REFRESH_TOKENS": True,  # Issue a new refresh token on every refresh call
     "BLACKLIST_AFTER_ROTATION": True,  # Invalidate the old refresh token after rotation

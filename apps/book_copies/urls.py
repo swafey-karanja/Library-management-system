@@ -25,7 +25,7 @@ urlpatterns = [
 
     # Create one or many copies — single object or array body, each
     # item optionally carrying `quantity`. See create.py.
-    path('create/', BookCopyCreateView.as_view(), name='create'),
+    path('add/', BookCopyCreateView.as_view(), name='create'),
 
     # <uuid:pk> matches a UUID segment and passes it in as pk.
     path('<uuid:pk>/update/', BookCopyUpdateView.as_view(), name='update'),
@@ -33,8 +33,8 @@ urlpatterns = [
     # Static path — doesn't collide with '<uuid:pk>/update/' above.
     path('bulk-update/', BookCopyBulkUpdateView.as_view(), name='bulk-update'),
 
-    # Aggregate statistics — see statistics.py.
-    path('statistics/', BookCopyStatisticsView.as_view(), name='statistics'),
+    # Aggregate statistics
+    path('stats/', BookCopyStatisticsView.as_view(), name='statistics'),
 
     # File download / upload — see import_export.py.
     path('export/', BookCopyExportView.as_view(), name='export'),
@@ -59,15 +59,22 @@ urlpatterns = [
 #   GET  /api/book-copies/?status=&condition=&library=&book_name=
 #   GET  /api/book-copies/?ordering=acquired_at | -acquired_at | created_at | -created_at
 #
-#   POST /api/book-copies/create/                    -> add a copy
-#   POST /api/book-copies/bulk-create/                -> many fully-specified copies
-#   POST /api/book-copies/add-copies/                 -> N copies of one book
+#   POST /api/book-copies/add/
+#     - single object body  -> creates one copy, single-object response
+#         {"library": "<uuid>", "book": "<uuid>"}
+#         {"library": "<uuid>", "book": "<uuid>", "barcode": "LIB-0001"}
+#         {"library": "<uuid>", "book": "<uuid>", "quantity": 5}   (list response, >1 row)
+#     - array body -> creates many, list response, e.g.
+#         [
+#             {"library": "<uuid>", "book": "<uuid_a>", "quantity": 5},
+#             {"library": "<uuid>", "book": "<uuid_b>", "barcode": "LIB-0099"}
+#         ]
 #
 #   PUT/PATCH /api/book-copies/<copy_uuid>/update/    -> update one copy
 #   PATCH /api/book-copies/bulk-update/               -> update many (status/
 #         condition/shelf_location/acquired_at only)
 #
-#   GET  /api/book-copies/statistics/                 -> aggregate counts
+#   GET  /api/book-copies/stats/                 -> aggregate counts
 #   GET  /api/book-copies/export/?format=csv|json      -> download (supports
 #         the same search/filter/ordering params as the list endpoint)
 #   POST /api/book-copies/import/                      -> CSV upload, upsert by barcode

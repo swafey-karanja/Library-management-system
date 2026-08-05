@@ -100,10 +100,10 @@ class BookCopy(models.Model):
     # SIMPLE FIELDS
     # ------------------------------------------------------------------
     # barcode VARCHAR(100) NOT NULL UNIQUE
-    # `unique=True` enforces the SQL UNIQUE constraint at the Django
-    # (application) level too, so you get a friendly ValidationError
-    # before Postgres would otherwise raise an IntegrityError.
-    barcode = models.CharField(max_length=100, unique=True)
+    # blank=True lets it be omitted on create — save() below auto-fills it
+    # from the book's ISBN if not provided. unique=True mirrors the DB
+    # constraint at the app level too.
+    barcode = models.CharField(max_length=100, unique=True, blank=True)
 
     # ------------------------------------------------------------------
     # ENUM-BACKED FIELDS: status & condition
@@ -244,6 +244,12 @@ class BookCopy(models.Model):
         """
         if not self.barcode:
             self.barcode = self._generate_barcode()
+
+        # Auto-populate acquired_at if not provided
+        if self.acquired_at is None:
+            from django.utils import timezone
+            self.acquired_at = timezone.now()
+
         super().save(*args, **kwargs)
 
     def _generate_barcode(self):
