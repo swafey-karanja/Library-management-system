@@ -100,6 +100,7 @@ INSTALLED_APPS = [
     "apps.books",  # Books management
     "apps.members", #Members app
     "apps.book_copies", #Book copies app
+    "apps.borrow_transactions" #Borrow Transactions app
 ]
 
 # ---------------------------------------------------------------------------

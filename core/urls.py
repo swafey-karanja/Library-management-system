@@ -48,4 +48,6 @@ urlpatterns = [
     path("api/members/", include("apps.members.urls")),
     # Members
     path("api/book-copies/", include("apps.book_copies.urls")),
+    # Borrow Transactions
+    path("api/borrow-transactions/", include("apps.borrow_transactions.urls"))
 ]
