@@ -70,6 +70,38 @@ class BookCopyListView(generics.ListAPIView):
     ordering = ['-created_at']  # stable default so pagination doesn't shift between requests
 
 
+class BookCopyDetailView(generics.RetrieveAPIView):
+    """
+    GET /api/book-copies/<identifier>/
+
+    <identifier> is EITHER a copy's UUID or its barcode — same endpoint
+    either way. This is what a "scan a barcode" screen calls: scan ->
+    GET this URL with the scanned string -> prefill the screen.
+
+    Both are unique columns, so either lookup is a single indexed
+    query — no meaningful cost difference between the two paths.
+    """
+
+    queryset = BookCopy.objects.select_related('library', 'book').all()
+    serializer_class = BookCopySerializer
+
+    def get_object(self):
+        identifier = self.kwargs['identifier']
+        queryset = self.filter_queryset(self.get_queryset())
+
+        # A real UUID string -> look up by pk. Anything else (e.g. a
+        # barcode like "LIB-0001") -> look up by barcode instead.
+        try:
+            uuid.UUID(identifier)
+            lookup = Q(pk=identifier)
+        except ValueError:
+            lookup = Q(barcode=identifier)
+
+        obj = get_object_or_404(queryset, lookup)
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+
 class BookCopyCreateView(APIView):
     """
     POST /api/book-copies/create/

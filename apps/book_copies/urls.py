@@ -14,7 +14,8 @@ from .views import (
     BookCopyBulkUpdateView,
     BookCopyStatisticsView,
     BookCopyExportView,
-    BookCopyImportView
+    BookCopyImportView,
+    BookCopyDetailView
 )
 
 # Namespaces these URLs, e.g. reverse('book_copies:list').
@@ -39,6 +40,14 @@ urlpatterns = [
     # File download / upload — see import_export.py.
     path('export/', BookCopyExportView.as_view(), name='export'),
     path('import/', BookCopyImportView.as_view(), name='import'),
+
+    # Catch-all single-segment lookup — MUST come last, after every
+    # static path above ('add/', 'bulk-update/', etc.), or a request
+    # like /stats/ would match here first with identifier='stats'
+    # instead of reaching BookCopyStatisticsView.
+    # <str:identifier> accepts EITHER a UUID or a barcode — see
+    # BookCopyDetailView.get_object() for how it tells them apart.
+    path('<str:identifier>/', BookCopyDetailView.as_view(), name='detail'),
 ]
 
 # --------------------------------------------------------------------
@@ -58,6 +67,10 @@ urlpatterns = [
 #   GET  /api/book-copies/?search=potter good        -> multiple terms (AND)
 #   GET  /api/book-copies/?status=&condition=&library=&book_name=
 #   GET  /api/book-copies/?ordering=acquired_at | -acquired_at | created_at | -created_at
+
+#   GET  /api/book-copies/<uuid>/     -> single copy, lookup by UUID
+#   GET  /api/book-copies/<barcode>/  -> single copy, lookup by barcode
+#         (same endpoint — see BookCopyDetailView)
 #
 #   POST /api/book-copies/add/
 #     - single object body  -> creates one copy, single-object response
