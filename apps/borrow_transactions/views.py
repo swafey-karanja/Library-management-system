@@ -1,22 +1,24 @@
 """
 views.py — BorrowTransaction views
 
-  1. BorrowTransactionListView       — GET  /api/borrow-transactions/
-  2. BorrowTransactionDetailView     — GET  /api/borrow-transactions/<pk>/
-  3. BorrowTransactionUpdateView     — PUT/PATCH /api/borrow-transactions/<pk>/update/
-  4. BorrowTransactionBulkUpdateView — PATCH /api/borrow-transactions/bulk-update/
-  5. BorrowCheckoutView              — POST /api/borrow-transactions/checkout/
-  6. BorrowBatchCheckoutView         — POST /api/borrow-transactions/batch-checkout/
-  7. BorrowReturnView                — POST /api/borrow-transactions/<pk>/return/
-  8. BorrowBatchReturnView           — POST /api/borrow-transactions/batch-return/
-  9. BorrowTransactionExportView     — GET  /api/borrow-transactions/export/
- 10. BorrowTransactionStatisticsView — GET  /api/borrow-transactions/statistics/
+  1. BorrowTransactionListView         — GET  /api/borrow-transactions/
+  2. BorrowTransactionDetailView       — GET  /api/borrow-transactions/<pk>/
+  3. BorrowTransactionActiveByCopyView — GET  /api/borrow-transactions/active/<identifier>/
+  4. BorrowTransactionUpdateView       — PUT/PATCH /api/borrow-transactions/<pk>/update/
+  5. BorrowTransactionBulkUpdateView   — PATCH /api/borrow-transactions/bulk-update/
+  6. BorrowCheckoutView                — POST /api/borrow-transactions/checkout/
+  7. BorrowBatchCheckoutView           — POST /api/borrow-transactions/batch-checkout/
+  8. BorrowReturnView                  — POST /api/borrow-transactions/<pk>/return/
+  9. BorrowBatchReturnView             — POST /api/borrow-transactions/batch-return/
+ 10. BorrowTransactionExportView       — GET  /api/borrow-transactions/export/
+ 11. BorrowTransactionStatisticsView   — GET  /api/borrow-transactions/statistics/
 """
 
 import csv
+import uuid
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.http import HttpResponse
 from django.utils import timezone
 
@@ -25,6 +27,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.filters import SearchFilter, OrderingFilter
+from rest_framework.generics import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import BorrowTransaction
@@ -66,6 +69,42 @@ def _sync_book_copy_status(borrow_transaction):
         book_copy.save(update_fields=['status'])
 
 
+# Fallback cap on active (not yet returned) loans a member may hold at
+# once, used ONLY when a library hasn't configured its own value (see
+# _get_active_loan_limit below). Kept as a constant so it's easy to
+# find/tune, same reasoning as BULK_UPDATABLE_FIELDS in serializers.py.
+DEFAULT_MAX_ACTIVE_LOANS_PER_MEMBER = 5
+
+# The JSON key read from library.enabled_modules for a per-library
+# override. Using the existing enabled_modules JSONB column means this
+# is configurable per library WITHOUT a schema change — e.g.:
+#   UPDATE library SET enabled_modules = enabled_modules ||
+#       '{"max_active_loans": 10}' WHERE library_id = '...';
+LIBRARY_MAX_ACTIVE_LOANS_KEY = 'max_active_loans'
+
+
+def _get_active_loan_limit(library):
+    """
+    A library's own active-loan cap, if it's set one, else the global
+    default. `library` may be None (e.g. if a member somehow has no
+    library set) — falls back to the default in that case too.
+
+    ASSUMPTION: this assumes the Member model has a `library` FK
+    (mirroring BookCopy's `library` FK in the book_copies app) — check
+    this against the actual members app once it exists.
+    """
+    if library is not None and isinstance(library.enabled_modules, dict):
+        configured_limit = library.enabled_modules.get(LIBRARY_MAX_ACTIVE_LOANS_KEY)
+        if isinstance(configured_limit, int) and configured_limit > 0:
+            return configured_limit
+    return DEFAULT_MAX_ACTIVE_LOANS_PER_MEMBER
+
+
+def _count_active_loans(member):
+    """How many not-yet-returned transactions this member currently has."""
+    return BorrowTransaction.objects.filter(member=member, returned_at__isnull=True).count()
+
+
 class BorrowTransactionListView(generics.ListAPIView):
     """
     GET /api/borrow-transactions/
@@ -94,6 +133,54 @@ class BorrowTransactionDetailView(generics.RetrieveAPIView):
     queryset = BorrowTransaction.objects.select_related('member', 'book_copy', 'book_copy__book').all()
     serializer_class = BorrowTransactionSerializer
     lookup_field = 'pk'
+
+
+class BorrowTransactionActiveByCopyView(generics.RetrieveAPIView):
+    """
+    GET /api/borrow-transactions/active/<identifier>/
+
+    <identifier> is EITHER a BookCopy's UUID or its barcode — same dual
+    lookup as BookCopyDetailView in the book_copies app. Returns that
+    copy's currently active (not yet returned) transaction, if any.
+
+    This is what a "return" screen calls right after a scan: scan ->
+    GET this URL -> get the transaction id back -> POST it to
+    <pk>/return/. It's the return-side equivalent of scanning a
+    barcode straight into BookCopyDetailView for checkout — without
+    it, returning a copy required a separate list-endpoint query
+    (?book_copy=<uuid>&status=active) to find the right transaction.
+
+    404 if the copy doesn't exist, OR exists but isn't currently
+    checked out (nothing to return).
+    """
+
+    serializer_class = BorrowTransactionSerializer
+
+    def get_object(self):
+        identifier = self.kwargs['identifier']
+
+        # Same UUID-vs-barcode detection as BookCopyDetailView, just
+        # filtering through the book_copy relation instead of the
+        # BookCopy table directly.
+        try:
+            uuid.UUID(identifier)
+            copy_lookup = Q(book_copy_id=identifier)
+        except ValueError:
+            copy_lookup = Q(book_copy__barcode=identifier)
+
+        queryset = (
+            BorrowTransaction.objects
+            .select_related('member', 'book_copy', 'book_copy__book')
+            .filter(returned_at__isnull=True)
+            .filter(copy_lookup)
+        )
+
+        # get_object_or_404 raises Http404 (-> DRF 404 response) if no
+        # row matches — covers both "copy doesn't exist" and "copy
+        # exists but isn't checked out" with one clear response.
+        obj = get_object_or_404(queryset)
+        self.check_object_permissions(self.request, obj)
+        return obj
 
 
 class BorrowTransactionUpdateView(generics.UpdateAPIView):
@@ -196,6 +283,22 @@ class BorrowCheckoutView(APIView):
         data = input_serializer.validated_data
 
         book_copy = data['book_copy']
+        member = data['member']
+
+        # Loan-limit check. Deliberately a plain count, not locked with
+        # select_for_update — a member's "how many books do I have out"
+        # isn't a single row we can lock the way a specific BookCopy
+        # is below, so two simultaneous checkouts for the same member
+        # could in rare cases both pass this check. Low-stakes enough
+        # (unlike double-lending one physical copy) to accept as a
+        # best-effort check rather than adding lock complexity for it.
+        active_loan_count = _count_active_loans(member)
+        loan_limit = _get_active_loan_limit(member.library)
+        if active_loan_count + 1 > loan_limit:
+            return Response(
+                {'detail': f'This member has reached their active loan limit ({loan_limit}).'},
+                status=status.HTTP_409_CONFLICT,
+            )
 
         with transaction.atomic():
             # select_for_update locks this row until commit, so two
@@ -210,7 +313,7 @@ class BorrowCheckoutView(APIView):
 
             borrow_transaction = BorrowTransaction(
                 book_copy=book_copy,
-                member=data['member'],
+                member=member,
                 borrowed_at=data.get('borrowed_at'),  # None -> model save() fills it in
                 due_date=data.get('due_date'),
             )
@@ -250,6 +353,26 @@ class BorrowBatchCheckoutView(APIView):
         # same trick used in serializers.py, avoids a circular import
         # between the borrow_transactions and book_copies apps.
         BookCopyModel = book_copies[0].__class__
+
+        # Loan-limit check: existing active loans PLUS everything in
+        # THIS batch, since a member could otherwise check out several
+        # books in one request and blow past their limit in one shot,
+        # even though each individual request "looked" under the cap.
+        # Same best-effort reasoning as the single-checkout view — see
+        # comment there.
+        active_loan_count = _count_active_loans(member)
+        loan_limit = _get_active_loan_limit(member.library)
+        if active_loan_count + len(book_copy_ids) > loan_limit:
+            return Response(
+                {
+                    'detail': (
+                        f'This member has {active_loan_count} active loan(s) and a limit of '
+                        f'{loan_limit}. This request would add {len(book_copy_ids)} more, '
+                        f'which exceeds the limit.'
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
         with transaction.atomic():
             # Lock every requested row up front, in one query, ordered

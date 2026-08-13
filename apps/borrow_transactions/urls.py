@@ -9,6 +9,7 @@ from django.urls import path
 from .views import (
     BorrowTransactionListView,
     BorrowTransactionDetailView,
+    BorrowTransactionActiveByCopyView,
     BorrowTransactionUpdateView,
     BorrowTransactionBulkUpdateView,
     BorrowCheckoutView,
@@ -27,6 +28,11 @@ urlpatterns = [
 
     # <uuid:pk> matches a UUID segment and passes it in as pk.
     path('<uuid:pk>/', BorrowTransactionDetailView.as_view(), name='detail'),
+
+    # <str:identifier> = a BookCopy UUID or barcode. Two segments
+    # ('active/' + identifier), so this can't collide with the single-
+    # segment '<uuid:pk>/' pattern above regardless of order.
+    path('active/<str:identifier>/', BorrowTransactionActiveByCopyView.as_view(), name='active-by-copy'),
 
     # Static paths — don't collide with '<uuid:pk>/' above.
     path('checkout/', BorrowCheckoutView.as_view(), name='checkout'),
@@ -59,6 +65,11 @@ urlpatterns = [
 #
 #   GET  /api/borrow-transactions/<uuid>/              -> single transaction
 #
+#   GET  /api/borrow-transactions/active/<uuid-or-barcode>/  -> that copy's
+#         currently active transaction (404 if not checked out). This is
+#         what a return screen calls right after a scan, to get the
+#         transaction id needed for <pk>/return/.
+#
 #   PUT/PATCH /api/borrow-transactions/<uuid>/update/   -> librarian correction
 #     (any of: book_copy, member, borrowed_at, due_date, returned_at,
 #      status, fine_amount — BookCopy.status is synced automatically
@@ -71,10 +82,14 @@ urlpatterns = [
 #
 #   POST /api/borrow-transactions/checkout/
 #     {"book_copy": "<uuid>", "member": "<uuid>"}
+#     409 if the copy isn't available, OR if the member is already at
+#     their active-loan limit (library-configurable — see
+#     _get_active_loan_limit in views.py).
 #
 #   POST /api/borrow-transactions/batch-checkout/     -> checkout several copies, one member
 #     {"member": "<uuid>", "book_copies": ["<uuid>", "<uuid>", ...]}
-#     All-or-nothing: any unavailable/missing copy fails the WHOLE batch.
+#     All-or-nothing: any unavailable/missing copy, OR the batch pushing
+#     the member over their active-loan limit, fails the WHOLE batch.
 #
 #   POST /api/borrow-transactions/<uuid>/return/
 #     {}  or  {"condition": "good"}  or  {"returned_at": "..."}
@@ -88,3 +103,12 @@ urlpatterns = [
 #
 #   GET  /api/borrow-transactions/export/?format=csv|json  -> download (supports
 #         the same search/filter/ordering params as the list endpoint)
+#
+# ACTIVE-LOAN LIMIT
+# ------------------
+# Each library can set its own cap by adding "max_active_loans" to its
+# `enabled_modules` JSONB column, e.g.:
+#   UPDATE library SET enabled_modules = enabled_modules ||
+#       '{"max_active_loans": 10}' WHERE library_id = '...';
+# Libraries that haven't set one fall back to
+# DEFAULT_MAX_ACTIVE_LOANS_PER_MEMBER in views.py (currently 5).
