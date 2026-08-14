@@ -30,6 +30,7 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.generics import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 
+from core.permissions import IsAdminOrLibrarian, LibraryScopedQuerysetMixin
 from .models import BorrowTransaction
 from .serializers import (
     BorrowTransactionSerializer,
@@ -105,7 +106,8 @@ def _count_active_loans(member):
     return BorrowTransaction.objects.filter(member=member, returned_at__isnull=True).count()
 
 
-class BorrowTransactionListView(generics.ListAPIView):
+class BorrowTransactionListView(LibraryScopedQuerysetMixin, generics.ListAPIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     GET /api/borrow-transactions/
 
@@ -119,6 +121,7 @@ class BorrowTransactionListView(generics.ListAPIView):
     queryset = BorrowTransaction.objects.select_related('member', 'book_copy', 'book_copy__book').all()
 
     serializer_class = BorrowTransactionSerializer
+    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
     pagination_class = BorrowTransactionPagination
 
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
@@ -128,14 +131,17 @@ class BorrowTransactionListView(generics.ListAPIView):
     ordering = ['-borrowed_at']  # stable default so pagination doesn't shift between requests
 
 
-class BorrowTransactionDetailView(generics.RetrieveAPIView):
+class BorrowTransactionDetailView(LibraryScopedQuerysetMixin, generics.RetrieveAPIView):
+    permission_classes = [IsAdminOrLibrarian]
     """GET /api/borrow-transactions/<pk>/"""
     queryset = BorrowTransaction.objects.select_related('member', 'book_copy', 'book_copy__book').all()
     serializer_class = BorrowTransactionSerializer
     lookup_field = 'pk'
+    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
 
 
-class BorrowTransactionActiveByCopyView(generics.RetrieveAPIView):
+class BorrowTransactionActiveByCopyView(LibraryScopedQuerysetMixin, generics.RetrieveAPIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     GET /api/borrow-transactions/active/<identifier>/
 
@@ -155,6 +161,7 @@ class BorrowTransactionActiveByCopyView(generics.RetrieveAPIView):
     """
 
     serializer_class = BorrowTransactionSerializer
+    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
 
     def get_object(self):
         identifier = self.kwargs['identifier']
@@ -183,7 +190,8 @@ class BorrowTransactionActiveByCopyView(generics.RetrieveAPIView):
         return obj
 
 
-class BorrowTransactionUpdateView(generics.UpdateAPIView):
+class BorrowTransactionUpdateView(LibraryScopedQuerysetMixin, generics.UpdateAPIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     PUT (full) / PATCH (partial) /api/borrow-transactions/<pk>/update/
 
@@ -194,6 +202,7 @@ class BorrowTransactionUpdateView(generics.UpdateAPIView):
     queryset = BorrowTransaction.objects.all()
     serializer_class = BorrowTransactionUpdateSerializer
     lookup_field = 'pk'
+    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
 
     def perform_update(self, serializer):
         with transaction.atomic():
@@ -202,6 +211,7 @@ class BorrowTransactionUpdateView(generics.UpdateAPIView):
 
 
 class BorrowTransactionBulkUpdateView(APIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     PATCH /api/borrow-transactions/bulk-update/
 
@@ -269,6 +279,7 @@ class BorrowTransactionBulkUpdateView(APIView):
 
 
 class BorrowCheckoutView(APIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     POST /api/borrow-transactions/checkout/
     Body: {"book_copy": "<uuid>", "member": "<uuid>"}
@@ -327,6 +338,7 @@ class BorrowCheckoutView(APIView):
 
 
 class BorrowBatchCheckoutView(APIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     POST /api/borrow-transactions/batch-checkout/
     Body: {"member": "<uuid>", "book_copies": ["<uuid>", "<uuid>", ...]}
@@ -432,6 +444,7 @@ class BorrowBatchCheckoutView(APIView):
 
 
 class BorrowReturnView(APIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     POST /api/borrow-transactions/<pk>/return/
     Body (optional): {"returned_at": "...", "condition": "good"}
@@ -475,6 +488,7 @@ class BorrowReturnView(APIView):
 
 
 class BorrowBatchReturnView(APIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     POST /api/borrow-transactions/batch-return/
     Body: {"returned_at": "...", "transactions": [{"id": "<uuid>", "condition": "good"}, ...]}
@@ -556,7 +570,8 @@ class BorrowBatchReturnView(APIView):
         return Response(output_serializer.data, status=status.HTTP_200_OK)
 
 
-class BorrowTransactionExportView(generics.GenericAPIView):
+class BorrowTransactionExportView(LibraryScopedQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     GET /api/borrow-transactions/export/?format=csv|json
 
@@ -570,6 +585,7 @@ class BorrowTransactionExportView(generics.GenericAPIView):
 
     queryset = BorrowTransaction.objects.select_related('member', 'book_copy', 'book_copy__book').all()
     serializer_class = BorrowTransactionSerializer
+    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
 
     # Same filter/search/ordering config as BorrowTransactionListView,
     # so exports can be scoped with the exact params used to browse.
@@ -634,6 +650,7 @@ class BorrowTransactionExportView(generics.GenericAPIView):
 
 
 class BorrowTransactionStatisticsView(APIView):
+    permission_classes = [IsAdminOrLibrarian]
     """
     GET /api/borrow-transactions/statistics/
     Counts/breakdowns, not individual rows.
