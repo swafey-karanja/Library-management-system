@@ -30,7 +30,7 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.generics import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 
-from core.permissions import IsAdminOrLibrarian, LibraryScopedQuerysetMixin
+from core.permissions import IsAdminOrLibrarian, LibraryScopedQuerysetMixin, scope_queryset_to_library
 from .models import BorrowTransaction
 from .serializers import (
     BorrowTransactionSerializer,
@@ -42,6 +42,13 @@ from .serializers import (
     BorrowBatchReturnSerializer,
     BULK_UPDATABLE_FIELDS,
 )
+
+
+# ORM path from BorrowTransaction down to a library id. This model has
+# no direct `library` FK (see models.py) — it's scoped through the
+# copy it references instead, since the copy is what actually belongs
+# to a library. Used everywhere below instead of repeating the string.
+BORROW_TRANSACTION_LIBRARY_LOOKUP = 'book_copy__library_id'
 
 
 class BorrowTransactionPagination(PageNumberPagination):
@@ -107,7 +114,6 @@ def _count_active_loans(member):
 
 
 class BorrowTransactionListView(LibraryScopedQuerysetMixin, generics.ListAPIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     GET /api/borrow-transactions/
 
@@ -116,12 +122,13 @@ class BorrowTransactionListView(LibraryScopedQuerysetMixin, generics.ListAPIView
     - ?search=term    -> member name / book title / barcode
     - ?ordering=borrowed_at | -borrowed_at | due_date | -due_date
     """
+    permission_classes = [IsAdminOrLibrarian]
 
     # select_related avoids N+1 queries for member_name / book_title / barcode.
     queryset = BorrowTransaction.objects.select_related('member', 'book_copy', 'book_copy__book').all()
 
     serializer_class = BorrowTransactionSerializer
-    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
+    library_lookup = BORROW_TRANSACTION_LIBRARY_LOOKUP
     pagination_class = BorrowTransactionPagination
 
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
@@ -132,16 +139,15 @@ class BorrowTransactionListView(LibraryScopedQuerysetMixin, generics.ListAPIView
 
 
 class BorrowTransactionDetailView(LibraryScopedQuerysetMixin, generics.RetrieveAPIView):
-    permission_classes = [IsAdminOrLibrarian]
     """GET /api/borrow-transactions/<pk>/"""
+    permission_classes = [IsAdminOrLibrarian]
     queryset = BorrowTransaction.objects.select_related('member', 'book_copy', 'book_copy__book').all()
     serializer_class = BorrowTransactionSerializer
     lookup_field = 'pk'
-    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
+    library_lookup = BORROW_TRANSACTION_LIBRARY_LOOKUP
 
 
 class BorrowTransactionActiveByCopyView(LibraryScopedQuerysetMixin, generics.RetrieveAPIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     GET /api/borrow-transactions/active/<identifier>/
 
@@ -159,9 +165,19 @@ class BorrowTransactionActiveByCopyView(LibraryScopedQuerysetMixin, generics.Ret
     404 if the copy doesn't exist, OR exists but isn't currently
     checked out (nothing to return).
     """
-
+    permission_classes = [IsAdminOrLibrarian]
     serializer_class = BorrowTransactionSerializer
-    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
+    library_lookup = BORROW_TRANSACTION_LIBRARY_LOOKUP
+
+    # BUG FIX: this view previously had no `queryset` attribute, and
+    # get_object() below queried BorrowTransaction.objects directly
+    # instead of going through self.get_queryset() — so the mixin's
+    # scoping was never actually applied here, despite being declared
+    # on the class. `queryset` here is what the mixin's get_queryset()
+    # scopes; get_object() now builds on top of THAT instead.
+    queryset = BorrowTransaction.objects.select_related(
+        'member', 'book_copy', 'book_copy__book'
+    ).filter(returned_at__isnull=True)
 
     def get_object(self):
         identifier = self.kwargs['identifier']
@@ -175,23 +191,21 @@ class BorrowTransactionActiveByCopyView(LibraryScopedQuerysetMixin, generics.Ret
         except ValueError:
             copy_lookup = Q(book_copy__barcode=identifier)
 
-        queryset = (
-            BorrowTransaction.objects
-            .select_related('member', 'book_copy', 'book_copy__book')
-            .filter(returned_at__isnull=True)
-            .filter(copy_lookup)
-        )
+        # self.get_queryset() -> mixin's SCOPED version -> narrowed to
+        # this one copy's active loan. Same pattern as
+        # BookCopyDetailView.get_object() in the book_copies app.
+        queryset = self.filter_queryset(self.get_queryset()).filter(copy_lookup)
 
         # get_object_or_404 raises Http404 (-> DRF 404 response) if no
-        # row matches — covers both "copy doesn't exist" and "copy
-        # exists but isn't checked out" with one clear response.
+        # row matches — covers "copy doesn't exist", "copy isn't
+        # checked out", AND "copy belongs to another library" with one
+        # response, same as intended for every scoped 404 elsewhere.
         obj = get_object_or_404(queryset)
         self.check_object_permissions(self.request, obj)
         return obj
 
 
 class BorrowTransactionUpdateView(LibraryScopedQuerysetMixin, generics.UpdateAPIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     PUT (full) / PATCH (partial) /api/borrow-transactions/<pk>/update/
 
@@ -199,10 +213,11 @@ class BorrowTransactionUpdateView(LibraryScopedQuerysetMixin, generics.UpdateAPI
     status, waiving/adjusting a fine, etc. After saving, the linked
     BookCopy's status is synced to match (see _sync_book_copy_status).
     """
+    permission_classes = [IsAdminOrLibrarian]
     queryset = BorrowTransaction.objects.all()
     serializer_class = BorrowTransactionUpdateSerializer
     lookup_field = 'pk'
-    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
+    library_lookup = BORROW_TRANSACTION_LIBRARY_LOOKUP
 
     def perform_update(self, serializer):
         with transaction.atomic():
@@ -211,7 +226,6 @@ class BorrowTransactionUpdateView(LibraryScopedQuerysetMixin, generics.UpdateAPI
 
 
 class BorrowTransactionBulkUpdateView(APIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     PATCH /api/borrow-transactions/bulk-update/
 
@@ -224,6 +238,7 @@ class BorrowTransactionBulkUpdateView(APIView):
     Each transaction's linked BookCopy is synced to match its new
     status, same as the single-item update view.
     """
+    permission_classes = [IsAdminOrLibrarian]
 
     def patch(self, request, *args, **kwargs):
         item_serializer = BorrowTransactionBulkUpdateItemSerializer(data=request.data, many=True)
@@ -238,9 +253,17 @@ class BorrowTransactionBulkUpdateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # One query for all rows, then check every id actually matched.
-        # select_related avoids an extra query per row when we sync book_copy.
-        existing_transactions = BorrowTransaction.objects.select_related('book_copy').filter(id__in=requested_ids)
+        # SCOPING: plain APIView, no get_queryset() for the mixin to
+        # hook into, so scope_queryset_to_library() is called directly
+        # here. A transaction outside the caller's library is simply
+        # absent from `existing_transactions` — so it falls straight
+        # into the existing "missing_ids" check below, same error as a
+        # genuinely bad id.
+        existing_transactions = scope_queryset_to_library(
+            BorrowTransaction.objects.select_related('book_copy'),
+            request.user,
+            library_lookup=BORROW_TRANSACTION_LIBRARY_LOOKUP,
+        ).filter(id__in=requested_ids)
         transactions_by_id = {txn.id: txn for txn in existing_transactions}
 
         missing_ids = set(requested_ids) - set(transactions_by_id.keys())
@@ -279,7 +302,6 @@ class BorrowTransactionBulkUpdateView(APIView):
 
 
 class BorrowCheckoutView(APIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     POST /api/borrow-transactions/checkout/
     Body: {"book_copy": "<uuid>", "member": "<uuid>"}
@@ -287,6 +309,7 @@ class BorrowCheckoutView(APIView):
     Creates the loan record AND flips the copy's status to checked_out —
     both happen or neither does (transaction.atomic).
     """
+    permission_classes = [IsAdminOrLibrarian]
 
     def post(self, request, *args, **kwargs):
         input_serializer = BorrowCheckoutSerializer(data=request.data)
@@ -295,6 +318,7 @@ class BorrowCheckoutView(APIView):
 
         book_copy = data['book_copy']
         member = data['member']
+        BookCopyModel = book_copy.__class__
 
         # Loan-limit check. Deliberately a plain count, not locked with
         # select_for_update — a member's "how many books do I have out"
@@ -312,10 +336,20 @@ class BorrowCheckoutView(APIView):
             )
 
         with transaction.atomic():
-            # select_for_update locks this row until commit, so two
-            # simultaneous checkouts of the same copy can't both pass
-            # the "is it available" check.
-            book_copy = book_copy.__class__.objects.select_for_update().get(pk=book_copy.pk)
+            # SCOPING: BorrowCheckoutSerializer's own queryset for
+            # `book_copy` is unscoped (any library's copy passes that
+            # first check) — this re-fetch is the real gate. Scoped +
+            # select_for_update together: a librarian can't lock/check
+            # out another library's copy, and two simultaneous
+            # checkouts of the same copy can't both pass "is it
+            # available" either.
+            try:
+                book_copy = scope_queryset_to_library(
+                    BookCopyModel.objects.select_for_update(), request.user
+                ).get(pk=book_copy.pk)
+            except BookCopyModel.DoesNotExist:
+                return Response({'detail': 'Book copy not found.'}, status=status.HTTP_404_NOT_FOUND)
+
             if book_copy.status != book_copy.STATUS_AVAILABLE:
                 return Response(
                     {'detail': f'This copy is not available to borrow (current status: {book_copy.status}).'},
@@ -338,7 +372,6 @@ class BorrowCheckoutView(APIView):
 
 
 class BorrowBatchCheckoutView(APIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     POST /api/borrow-transactions/batch-checkout/
     Body: {"member": "<uuid>", "book_copies": ["<uuid>", "<uuid>", ...]}
@@ -352,6 +385,7 @@ class BorrowBatchCheckoutView(APIView):
     pattern as the single-item BorrowCheckoutView above, just looping
     over several copies instead of one.
     """
+    permission_classes = [IsAdminOrLibrarian]
 
     def post(self, request, *args, **kwargs):
         input_serializer = BorrowBatchCheckoutSerializer(data=request.data)
@@ -387,12 +421,16 @@ class BorrowBatchCheckoutView(APIView):
             )
 
         with transaction.atomic():
-            # Lock every requested row up front, in one query, ordered
-            # by pk. Locking in a consistent order (rather than one
-            # copy at a time in request order) avoids two overlapping
-            # batches deadlocking each other over the same set of copies.
+            # SCOPING: same reasoning as BorrowCheckoutView — the
+            # serializer's own PrimaryKeyRelatedField queryset is
+            # unscoped, so this is the real gate. A copy outside the
+            # caller's library is simply absent from `locked_copies`,
+            # which the existing "Not found" branch below already
+            # handles — no extra error-handling code needed here.
             locked_copies = list(
-                BookCopyModel.objects.select_for_update().filter(pk__in=book_copy_ids).order_by('pk')
+                scope_queryset_to_library(BookCopyModel.objects.select_for_update(), request.user)
+                .filter(pk__in=book_copy_ids)
+                .order_by('pk')
             )
             locked_by_id = {copy.pk: copy for copy in locked_copies}
 
@@ -444,7 +482,6 @@ class BorrowBatchCheckoutView(APIView):
 
 
 class BorrowReturnView(APIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     POST /api/borrow-transactions/<pk>/return/
     Body (optional): {"returned_at": "...", "condition": "good"}
@@ -452,10 +489,20 @@ class BorrowReturnView(APIView):
     Marks the loan returned, calculates any fine, and puts the copy
     back on the shelf (or into "damaged" if a condition was given).
     """
+    permission_classes = [IsAdminOrLibrarian]
 
     def post(self, request, *args, **kwargs):
+        # SCOPING: plain pk lookup by URL <pk>, no serializer queryset
+        # to fall back on — scope_queryset_to_library() is the only
+        # gate here. A transaction outside the caller's library is
+        # absent from the scoped queryset, so .get() raises
+        # DoesNotExist -> the SAME 404 already used for a bad pk below.
         try:
-            borrow_transaction = BorrowTransaction.objects.select_related('book_copy').get(pk=kwargs['pk'])
+            borrow_transaction = scope_queryset_to_library(
+                BorrowTransaction.objects.select_related('book_copy'),
+                request.user,
+                library_lookup=BORROW_TRANSACTION_LIBRARY_LOOKUP,
+            ).get(pk=kwargs['pk'])
         except BorrowTransaction.DoesNotExist:
             return Response({'detail': 'Borrow transaction not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -488,7 +535,6 @@ class BorrowReturnView(APIView):
 
 
 class BorrowBatchReturnView(APIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     POST /api/borrow-transactions/batch-return/
     Body: {"returned_at": "...", "transactions": [{"id": "<uuid>", "condition": "good"}, ...]}
@@ -502,6 +548,7 @@ class BorrowBatchReturnView(APIView):
     transaction.atomic() block for the whole batch, same shape as
     BorrowBatchCheckoutView above.
     """
+    permission_classes = [IsAdminOrLibrarian]
 
     def post(self, request, *args, **kwargs):
         input_serializer = BorrowBatchReturnSerializer(data=request.data)
@@ -518,10 +565,17 @@ class BorrowBatchReturnView(APIView):
             # rows in one query — Postgres locks joined tables too by
             # default. That's exactly what we want: nothing else can
             # check out or return these same copies until we commit.
+            #
+            # SCOPING: same pattern as bulk-update — a transaction
+            # outside the caller's library is simply absent from
+            # `locked_transactions`, so it falls into the existing
+            # "Not found" branch below with no extra code needed.
             locked_transactions = list(
-                BorrowTransaction.objects
-                .select_for_update()
-                .select_related('book_copy')
+                scope_queryset_to_library(
+                    BorrowTransaction.objects.select_for_update().select_related('book_copy'),
+                    request.user,
+                    library_lookup=BORROW_TRANSACTION_LIBRARY_LOOKUP,
+                )
                 .filter(pk__in=requested_ids)
                 .order_by('pk')  # consistent lock order, same reasoning as batch checkout
             )
@@ -571,7 +625,6 @@ class BorrowBatchReturnView(APIView):
 
 
 class BorrowTransactionExportView(LibraryScopedQuerysetMixin, generics.GenericAPIView):
-    permission_classes = [IsAdminOrLibrarian]
     """
     GET /api/borrow-transactions/export/?format=csv|json
 
@@ -582,10 +635,11 @@ class BorrowTransactionExportView(LibraryScopedQuerysetMixin, generics.GenericAP
     and get_serializer() without forcing the normal paginated JSON
     response shape, since this returns a file instead.
     """
+    permission_classes = [IsAdminOrLibrarian]
 
     queryset = BorrowTransaction.objects.select_related('member', 'book_copy', 'book_copy__book').all()
     serializer_class = BorrowTransactionSerializer
-    library_lookup = 'book_copy__library_id'  # no direct FK to library on this model
+    library_lookup = BORROW_TRANSACTION_LIBRARY_LOOKUP
 
     # Same filter/search/ordering config as BorrowTransactionListView,
     # so exports can be scoped with the exact params used to browse.
