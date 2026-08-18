@@ -42,7 +42,7 @@ from .serializers import (
     BorrowBatchReturnSerializer,
     BULK_UPDATABLE_FIELDS,
 )
-
+from .notifications import notify_checkout, notify_return, notify_update, NOTIFIABLE_FIELDS
 
 # ORM path from BorrowTransaction down to a library id. This model has
 # no direct `library` FK (see models.py) — it's scoped through the
@@ -220,9 +220,14 @@ class BorrowTransactionUpdateView(LibraryScopedQuerysetMixin, generics.UpdateAPI
     library_lookup = BORROW_TRANSACTION_LIBRARY_LOOKUP
 
     def perform_update(self, serializer):
+        before = {field: getattr(serializer.instance, field) for field in NOTIFIABLE_FIELDS}
+
         with transaction.atomic():
             borrow_transaction = serializer.save()
             _sync_book_copy_status(borrow_transaction)
+
+        after = {field: getattr(borrow_transaction, field) for field in NOTIFIABLE_FIELDS}
+        notify_update(borrow_transaction.id, before, after)
 
 
 class BorrowTransactionBulkUpdateView(APIView):
@@ -281,6 +286,7 @@ class BorrowTransactionBulkUpdateView(APIView):
         with transaction.atomic():
             for item in items:
                 borrow_transaction = transactions_by_id[item['id']]
+                before = {field: getattr(borrow_transaction, field) for field in NOTIFIABLE_FIELDS}
 
                 # Only touch fields actually present in this item.
                 changed_fields = [
@@ -295,6 +301,10 @@ class BorrowTransactionBulkUpdateView(APIView):
                 # columns — extra safety net beyond the serializer.
                 borrow_transaction.save(update_fields=changed_fields)
                 _sync_book_copy_status(borrow_transaction)
+
+                after = {field: getattr(borrow_transaction, field) for field in NOTIFIABLE_FIELDS}
+                notify_update(borrow_transaction.id, before, after)
+
                 updated_transactions.append(borrow_transaction)
 
         response_serializer = BorrowTransactionSerializer(updated_transactions, many=True)
@@ -366,6 +376,8 @@ class BorrowCheckoutView(APIView):
 
             book_copy.status = book_copy.STATUS_BORROWED
             book_copy.save(update_fields=['status'])
+
+            notify_checkout([borrow_transaction.id])
 
         output_serializer = BorrowTransactionSerializer(borrow_transaction)
         return Response(output_serializer.data, status=status.HTTP_201_CREATED)
@@ -477,6 +489,8 @@ class BorrowBatchCheckoutView(APIView):
 
                 created_transactions.append(borrow_transaction)
 
+        notify_checkout([txn.id for txn in created_transactions])
+
         output_serializer = BorrowTransactionSerializer(created_transactions, many=True)
         return Response(output_serializer.data, status=status.HTTP_201_CREATED)
 
@@ -529,6 +543,8 @@ class BorrowReturnView(APIView):
                 else book_copy.STATUS_AVAILABLE
             )
             book_copy.save(update_fields=['status', 'condition'])
+
+        notify_return([borrow_transaction.id])
 
         output_serializer = BorrowTransactionSerializer(borrow_transaction)
         return Response(output_serializer.data, status=status.HTTP_200_OK)
@@ -619,6 +635,8 @@ class BorrowBatchReturnView(APIView):
                 book_copy.save(update_fields=['status', 'condition'])
 
                 returned_transactions.append(borrow_transaction)
+
+        notify_return([txn.id for txn in returned_transactions])
 
         output_serializer = BorrowTransactionSerializer(returned_transactions, many=True)
         return Response(output_serializer.data, status=status.HTTP_200_OK)

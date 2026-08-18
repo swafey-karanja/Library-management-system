@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: sans-serif; color: #222;">
+  <p>Hi {{ member.name }},</p>
+
+  {% if books|length == 1 %}
+    <p>You've returned the following book:</p>
+  {% else %}
+    <p>You've returned the following {{ books|length }} books:</p>
+  {% endif %}
+
+  <table cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+    <thead>
+      <tr style="text-align: left; border-bottom: 2px solid #ddd;">
+        <th>Title</th>
+        <th>Barcode</th>
+        <th>Returned</th>
+        <th>Fine</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for book in books %}
+      <tr style="border-bottom: 1px solid #eee;">
+        <td>{{ book.title }}</td>
+        <td>{{ book.barcode }}</td>
+        <td>{{ book.returned_at }}</td>
+        <td>{{ book.fine_amount }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if total_fines > 0 %}
+  <p style="margin-top: 16px;"><strong>Total fines from this return: {{ total_fines }}</strong></p>
+  {% endif %}
+
+  <p>Thanks,<br>Your Library</p>
+</body>
+</html>

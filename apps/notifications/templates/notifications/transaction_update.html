@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: sans-serif; color: #222;">
+  <p>Hi {{ member.name }},</p>
+
+  <p>An update was made to your loan of <strong>"{{ book_title }}"</strong> (barcode: {{ barcode }}):</p>
+
+  <table cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+    <thead>
+      <tr style="text-align: left; border-bottom: 2px solid #ddd;">
+        <th>Field</th>
+        <th>Old value</th>
+        <th>New value</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for change in changes %}
+      <tr style="border-bottom: 1px solid #eee;">
+        <td>{{ change.label }}</td>
+        <td>{{ change.old|default:"(none)" }}</td>
+        <td>{{ change.new|default:"(none)" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <p style="margin-top: 16px;">If you have any questions about this change, please contact your library.</p>
+  <p>Thanks,<br>Your Library</p>
+</body>
+</html>

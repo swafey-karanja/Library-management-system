@@ -1,0 +1,12 @@
+Hi {{ member.name }},
+
+{% if books|length == 1 %}You've checked out the following book:{% else %}You've checked out the following {{ books|length }} books:{% endif %}
+{% for book in books %}
+- {{ book.title }} (barcode: {{ book.barcode }})
+  Borrowed: {{ book.borrowed_at }}
+  Due back: {{ book.due_date }}
+{% endfor %}
+Please return your book(s) by the due date to avoid a late fine.
+
+Thanks,
+Your Library

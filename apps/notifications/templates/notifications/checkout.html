@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: sans-serif; color: #222;">
+  <p>Hi {{ member.name }},</p>
+
+  {% if books|length == 1 %}
+    <p>You've checked out the following book:</p>
+  {% else %}
+    <p>You've checked out the following {{ books|length }} books:</p>
+  {% endif %}
+
+  <table cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+    <thead>
+      <tr style="text-align: left; border-bottom: 2px solid #ddd;">
+        <th>Title</th>
+        <th>Barcode</th>
+        <th>Borrowed</th>
+        <th>Due back</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for book in books %}
+      <tr style="border-bottom: 1px solid #eee;">
+        <td>{{ book.title }}</td>
+        <td>{{ book.barcode }}</td>
+        <td>{{ book.borrowed_at }}</td>
+        <td>{{ book.due_date }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <p style="margin-top: 16px;">Please return your book(s) by the due date to avoid a late fine.</p>
+  <p>Thanks,<br>Your Library</p>
+</body>
+</html>
