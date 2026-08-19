@@ -3,7 +3,7 @@ Hi {{ member.name }},
 {% if books|length == 1 %}You've returned the following book:{% else %}You've returned the following {{ books|length }} books:{% endif %}
 {% for book in books %}
 - {{ book.title }} (barcode: {{ book.barcode }})
-  Returned: {{ book.returned_at }}
+  Returned: {{ book.returned_at|date:"d F Y, g:i A" }}
   Fine: {{ book.fine_amount }}
 {% endfor %}
 {% if total_fines > 0 %}

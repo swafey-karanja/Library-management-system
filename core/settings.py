@@ -90,6 +90,7 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt",  # JWT authentication support
     "rest_framework_simplejwt.token_blacklist",
     "corsheaders",  # Handles Cross-Origin Resource Sharing for the frontend
+    "anymail",
     # --- Our own apps (one per module) ---
     # ---------------------------------------------------------------------------
     # MODULES
@@ -100,7 +101,8 @@ INSTALLED_APPS = [
     "apps.books",  # Books management
     "apps.members", #Members app
     "apps.book_copies", #Book copies app
-    "apps.borrow_transactions" #Borrow Transactions app
+    "apps.borrow_transactions", #Borrow Transactions app
+    "apps.notifications" #notifications app
 ]
 
 # ---------------------------------------------------------------------------
@@ -294,3 +296,6 @@ RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "noreply@swafey.top")
 
 # Base URL of the frontend app — used to build the reset link in emails.
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+
+EMAIL_BACKEND = "anymail.backends.resend.EmailBackend"
+ANYMAIL = { "RESEND_API_KEY": os.environ.get("RESEND_API_KEY"), }

@@ -16,6 +16,7 @@ an update email, or swapping Celery for something else), this is the
 one file to touch - views.py doesn't change.
 """
 from django.db import transaction
+from datetime import datetime
 
 from apps.notifications.tasks import send_checkout_email, send_return_email, send_update_email
 
@@ -65,10 +66,21 @@ def notify_update(transaction_id, before, after):
     if not changes:
         return
 
+    # due_date/returned_at are datetimes and get a human-readable format;
+    # everything else (status, fine_amount) just gets str()'d as before.
+    DATETIME_FIELDS = {"due_date", "returned_at"}
+
+    def _format_value(field, value):
+        if value is None:
+            return None
+        if field in DATETIME_FIELDS and isinstance(value, datetime):
+            return value.strftime("%d %B %Y, %I:%M %p")
+        return str(value)
+
     serializable_changes = {
         field: {
-            "old": str(diff["old"]) if diff["old"] is not None else None,
-            "new": str(diff["new"]) if diff["new"] is not None else None,
+            "old": _format_value(field, diff["old"]),
+            "new": _format_value(field, diff["new"]),
         }
         for field, diff in changes.items()
     }

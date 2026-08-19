@@ -23,8 +23,8 @@
       <tr style="border-bottom: 1px solid #eee;">
         <td>{{ book.title }}</td>
         <td>{{ book.barcode }}</td>
-        <td>{{ book.borrowed_at }}</td>
-        <td>{{ book.due_date }}</td>
+        <td>{{ book.borrowed_at|date:"d F Y, g:i A" }}</td>
+        <td>{{ book.due_date|date:"d F Y, g:i A" }}</td>
       </tr>
       {% endfor %}
     </tbody>

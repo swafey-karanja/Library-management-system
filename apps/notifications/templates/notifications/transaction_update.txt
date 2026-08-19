@@ -1,8 +1,9 @@
 Hi {{ member.name }},
 
 An update was made to your loan of "{{ book_title }}" (barcode: {{ barcode }}):
+
 {% for change in changes %}
-- {{ change.label }}: {{ change.old|default:"(none)" }} -> {{ change.new|default:"(none)" }}
+The "{{ change.label }}" changed from "{{ change.old|default:"(none)" }}" to "{{ change.new|default:"(none)" }}".
 {% endfor %}
 If you have any questions about this change, please contact your library.
 
