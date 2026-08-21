@@ -31,9 +31,27 @@ from celery import shared_task
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
+from collections import defaultdict
+from datetime import timedelta
+
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
+# How far ahead of due_date to send the "due soon" reminder.
+DUE_SOON_LEAD_HOURS = 24
+
+# The due-soon scan runs every DUE_SOON_SCAN_INTERVAL_HOURS (see the
+# Celery Beat schedule in settings.py — keep these two numbers in
+# sync if you ever change the schedule). The candidate window below
+# is made TWICE as wide as a single scan interval on purpose: it
+# spans two intervals' worth of time around the 24h mark, so that if
+# one scheduled run is ever missed (worker restart, broker hiccup,
+# etc), the very next run still catches every transaction that
+# should have been reminded. NotificationLog's unique constraint
+# guarantees this redundancy never causes a duplicate send — only
+# acts as a backstop against a missed one.
+DUE_SOON_SCAN_INTERVAL_HOURS = 6
 
 def _send_email(subject, template_base, context, to_email):
     """
@@ -204,3 +222,184 @@ def send_update_email(self, transaction_id, changes):
     except Exception as exc:
         logger.exception("send_update_email failed for transaction %s", transaction_id)
         raise self.retry(exc=exc)
+
+@shared_task
+def send_due_soon_reminders():
+    """
+    Runs every 6 hours (see CELERY_BEAT_SCHEDULE). Finds active loans
+    due in roughly the next 24-30 hours that haven't already been
+    reminded about, groups them by member, and sends ONE email per
+    member listing everything due soon.
+    """
+    from apps.borrow_transactions.models import BorrowTransaction
+    from .models import NotificationLog
+
+    now = timezone.now()
+    window_start = now + timedelta(hours=DUE_SOON_LEAD_HOURS - DUE_SOON_SCAN_INTERVAL_HOURS)
+    window_end = now + timedelta(hours=DUE_SOON_LEAD_HOURS + DUE_SOON_SCAN_INTERVAL_HOURS)
+
+    candidates = list(
+        BorrowTransaction.objects.select_related("member", "book_copy", "book_copy__book")
+        .filter(returned_at__isnull=True, due_date__gte=window_start, due_date__lt=window_end)
+    )
+    if not candidates:
+        return
+
+    # One query to find everything already sent, instead of one query
+    # per candidate (N+1) — see the earlier note on this exact risk.
+    already_sent = set(
+        NotificationLog.objects.filter(
+            notification_type=NotificationLog.TYPE_DUE_SOON,
+            borrow_transaction_id__in=[txn.id for txn in candidates],
+        ).values_list("borrow_transaction_id", "sent_for_date")
+    )
+    pending = [
+        txn for txn in candidates
+        if (txn.id, txn.due_date.date()) not in already_sent
+    ]
+    if not pending:
+        return
+
+    by_member = defaultdict(list)
+    for txn in pending:
+        by_member[txn.member_id].append(txn)
+
+    for member_id, txns in by_member.items():
+        member = txns[0].member
+        if not member.email:
+            logger.info("send_due_soon_reminders: member %s has no email on file, skipping", member_id)
+            continue
+
+        books = [
+            {
+                "title": txn.book_copy.book.title,
+                "barcode": txn.book_copy.barcode,
+                "due_date": txn.due_date,
+            }
+            for txn in txns
+        ]
+        subject = (
+            "A book is due soon" if len(books) == 1
+            else f"{len(books)} books are due soon"
+        )
+
+        try:
+            _send_email(
+                subject=subject,
+                template_base="due_soon",
+                context={"member": member, "books": books},
+                to_email=member.email,
+            )
+        except Exception:
+            # Don't let one member's send failure stop the rest of the
+            # batch, and DON'T log these as sent — leaving them
+            # unlogged means the NEXT scan run simply picks these
+            # transactions back up and retries them naturally, no
+            # separate retry mechanism needed.
+            logger.exception("send_due_soon_reminders failed for member %s", member_id)
+            continue
+
+        NotificationLog.objects.bulk_create(
+            [
+                NotificationLog(
+                    borrow_transaction_id=txn.id,
+                    notification_type=NotificationLog.TYPE_DUE_SOON,
+                    sent_for_date=txn.due_date.date(),
+                )
+                for txn in txns
+            ],
+            ignore_conflicts=True,  # belt-and-suspenders against a race with another run
+        )
+
+
+@shared_task
+def send_overdue_reminders():
+    """
+    Runs once daily (see CELERY_BEAT_SCHEDULE). Finds every active
+    loan that's currently overdue, recalculates and PERSISTS its
+    current fine_amount (previously this only happened at return —
+    see the fine-calculation review earlier in this project), groups
+    by member, and sends one "these books are overdue" email per
+    member.
+    """
+    from apps.borrow_transactions.models import BorrowTransaction
+    from .models import NotificationLog
+
+    now = timezone.now()
+    today = now.date()
+
+    overdue_transactions = list(
+        BorrowTransaction.objects.select_related("member", "book_copy", "book_copy__book")
+        .filter(returned_at__isnull=True, due_date__lt=now)
+    )
+    if not overdue_transactions:
+        return
+
+    # Recalculate and persist the live fine for every overdue loan
+    # while we're already scanning them — keeps fine_amount realistic
+    # in the API/admin for loans that are still out, not just at
+    # return time (this was previously stale at 0.00 until return —
+    # see the earlier fine-calculation confirmation).
+    for txn in overdue_transactions:
+        txn.fine_amount = txn.calculate_fine()
+    BorrowTransaction.objects.bulk_update(overdue_transactions, ["fine_amount"])
+
+    already_sent = set(
+        NotificationLog.objects.filter(
+            notification_type=NotificationLog.TYPE_OVERDUE,
+            sent_for_date=today,
+            borrow_transaction_id__in=[txn.id for txn in overdue_transactions],
+        ).values_list("borrow_transaction_id", flat=True)
+    )
+    pending = [txn for txn in overdue_transactions if txn.id not in already_sent]
+    if not pending:
+        return
+
+    by_member = defaultdict(list)
+    for txn in pending:
+        by_member[txn.member_id].append(txn)
+
+    for member_id, txns in by_member.items():
+        member = txns[0].member
+        if not member.email:
+            logger.info("send_overdue_reminders: member %s has no email on file, skipping", member_id)
+            continue
+
+        books = [
+            {
+                "title": txn.book_copy.book.title,
+                "barcode": txn.book_copy.barcode,
+                "due_date": txn.due_date,
+                "days_overdue": txn.days_overdue,
+                "fine_amount": txn.fine_amount,
+            }
+            for txn in txns
+        ]
+        total_fines = sum((book["fine_amount"] for book in books), Decimal("0.00"))
+        subject = (
+            "A book is overdue" if len(books) == 1
+            else f"{len(books)} books are overdue"
+        )
+
+        try:
+            _send_email(
+                subject=subject,
+                template_base="overdue",
+                context={"member": member, "books": books, "total_fines": total_fines},
+                to_email=member.email,
+            )
+        except Exception:
+            logger.exception("send_overdue_reminders failed for member %s", member_id)
+            continue
+
+        NotificationLog.objects.bulk_create(
+            [
+                NotificationLog(
+                    borrow_transaction_id=txn.id,
+                    notification_type=NotificationLog.TYPE_OVERDUE,
+                    sent_for_date=today,
+                )
+                for txn in txns
+            ],
+            ignore_conflicts=True,
+        )

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: sans-serif; color: #222;">
+  <p>Hi {{ member.name }},</p>
+
+  {% if books|length == 1 %}
+    <p>The following book is overdue:</p>
+  {% else %}
+    <p>The following {{ books|length }} books are overdue:</p>
+  {% endif %}
+
+  <table cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+    <thead>
+      <tr style="text-align: left; border-bottom: 2px solid #ddd;">
+        <th>Title</th>
+        <th>Barcode</th>
+        <th>Was due</th>
+        <th>Days overdue</th>
+        <th>Fine so far</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for book in books %}
+      <tr style="border-bottom: 1px solid #eee;">
+        <td>{{ book.title }}</td>
+        <td>{{ book.barcode }}</td>
+        <td>{{ book.due_date|date:"d F Y, g:i A" }}</td>
+        <td>{{ book.days_overdue }}</td>
+        <td>{{ book.fine_amount }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <p style="margin-top: 16px;"><strong>Total fines accrued: {{ total_fines }}</strong></p>
+  <p>Please return your book(s) as soon as possible to avoid further charges.</p>
+  <p>Thanks,<br>Your Library</p>
+</body>
+</html>

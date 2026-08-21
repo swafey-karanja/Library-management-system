@@ -1,0 +1,15 @@
+Hi {{ member.name }},
+
+{% if books|length == 1 %}The following book is overdue:{% else %}The following {{ books|length }} books are overdue:{% endif %}
+{% for book in books %}
+- {{ book.title }} (barcode: {{ book.barcode }})
+  Was due: {{ book.due_date|date:"d F Y, g:i A" }}
+  Days overdue: {{ book.days_overdue }}
+  Fine so far: {{ book.fine_amount }}
+{% endfor %}
+Total fines accrued: {{ total_fines }}
+
+Please return your book(s) as soon as possible to avoid further charges.
+
+Thanks,
+Your Library

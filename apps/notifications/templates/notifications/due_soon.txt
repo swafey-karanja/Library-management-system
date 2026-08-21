@@ -1,0 +1,11 @@
+Hi {{ member.name }},
+
+{% if books|length == 1 %}The following book is due soon:{% else %}The following {{ books|length }} books are due soon:{% endif %}
+{% for book in books %}
+- {{ book.title }} (barcode: {{ book.barcode }})
+  Due: {{ book.due_date|date:"d F Y, g:i A" }}
+{% endfor %}
+Please return your book(s) by the due date to avoid a late fine.
+
+Thanks,
+Your Library

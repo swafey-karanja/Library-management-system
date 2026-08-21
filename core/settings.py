@@ -32,6 +32,7 @@ import os
 
 # import sys
 from dotenv import load_dotenv
+from celery.schedules import crontab
 
 # ---------------------------------------------------------------------------
 # BASE DIRECTORY
@@ -102,7 +103,8 @@ INSTALLED_APPS = [
     "apps.members", #Members app
     "apps.book_copies", #Book copies app
     "apps.borrow_transactions", #Borrow Transactions app
-    "apps.notifications" #notifications app
+    "apps.notifications", #notifications app
+    "apps.reservations"
 ]
 
 # ---------------------------------------------------------------------------
@@ -287,7 +289,6 @@ CORS_ALLOW_CREDENTIALS = True
 # doesn't have.
 AUTH_USER_MODEL = "users.User"
 
-
 # ---------------------------------------------------------------------------
 # RESEND EMAIL SERVICE
 # ---------------------------------------------------------------------------
@@ -299,3 +300,22 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 
 EMAIL_BACKEND = "anymail.backends.resend.EmailBackend"
 ANYMAIL = { "RESEND_API_KEY": os.environ.get("RESEND_API_KEY"), }
+
+CELERY_TIMEZONE = TIME_ZONE  # reuse whatever Django's TIME_ZONE already is
+CELERY_BEAT_SCHEDULE = {
+    "send-due-soon-reminders": {
+        "task": "apps.notifications.tasks.send_due_soon_reminders",
+        # Every 6 hours, on the hour.
+        "schedule": crontab(minute=0, hour="0,6,12,18"),
+    },
+    "send-overdue-reminders": {
+        "task": "apps.notifications.tasks.send_overdue_reminders",
+        # Once daily at 07:00. Change the hour to whatever suits —
+        # e.g. early morning so members see it before their day starts.
+        "schedule": crontab(minute=0, hour=7),
+    },
+    'expire-reservations-every-15-minutes': {
+        'task': 'reservations.expire_reservations',  # matches name= above
+        'schedule': crontab(minute='*/15'),
+    },
+}
