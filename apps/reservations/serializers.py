@@ -2,7 +2,7 @@ from django.utils import timezone
 from datetime import timedelta
 from rest_framework import serializers
 from .models import Reservation
-from book_copies.models import BookCopy  # adjust to your actual app/model path
+from apps.book_copies.models import BookCopy  # adjust to your actual app/model path
 
 
 class ReservationListSerializer(serializers.ModelSerializer):

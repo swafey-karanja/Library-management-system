@@ -9,7 +9,7 @@ from .models import Reservation
 from .serializers import ReservationListSerializer, ReservationCreateSerializer
 from .filters import ReservationFilter
 from .pagination import ReservationPagination
-from book_copies.models import BookCopy  # needed for the status constant below
+from apps.book_copies.models import BookCopy  # needed for the status constant below
 
 
 class ReservationListCreateView(generics.ListCreateAPIView):
