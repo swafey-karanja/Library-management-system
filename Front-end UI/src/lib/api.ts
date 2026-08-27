@@ -74,3 +74,39 @@ api.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+
+/**
+ * Django REST Framework errors show up in a couple of different shapes
+ * depending on the endpoint:
+ *   - hand-written views (e.g. login) return {"detail": "..."}
+ *   - serializer validation errors return {"field_name": ["message", ...]}
+ * This normalizes either into one readable string for a toast.
+ */
+export function getErrorMessage(error: unknown): string {
+  if (typeof error === "object" && error !== null && "response" in error) {
+    const response = (error as { response?: { data?: unknown } }).response;
+    const data = response?.data;
+
+    if (typeof data === "string") return data;
+
+    if (data && typeof data === "object") {
+      const obj = data as Record<string, unknown>;
+      if (typeof obj.detail === "string") return obj.detail;
+
+      // Fall back to the first field's first error message,
+      // e.g. {"email": ["A user with this email already exists."]}
+      const firstKey = Object.keys(obj)[0];
+      if (firstKey) {
+        const value = obj[firstKey];
+        const message = Array.isArray(value) ? value[0] : value;
+        if (typeof message === "string") {
+          return firstKey === "detail" || firstKey === "non_field_errors"
+            ? message
+            : `${firstKey}: ${message}`;
+        }
+      }
+    }
+  }
+
+  return "Something went wrong. Please try again.";
+}

@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -19,7 +20,9 @@ export default function Home() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <Button>Get started</Button>
+          <Button asChild>
+            <Link href="/login">Get started</Link>
+          </Button>
         </CardContent>
       </Card>
     </main>
