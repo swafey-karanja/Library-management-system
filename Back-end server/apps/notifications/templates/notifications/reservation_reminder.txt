@@ -1,0 +1,8 @@
+Dear {{ member.name }},
+
+This is a reminder to collect your reserved copy of {{ book_title }} before {{ reservation_expiry_date|date:"d F Y" }}.
+
+Please collect the book by this date to avoid the reservation expiring and the copy being made available to another member.
+
+Kind regards,
+Library Team

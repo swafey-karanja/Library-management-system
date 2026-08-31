@@ -1,66 +1,62 @@
 from django.utils import timezone
-from datetime import timedelta
 from rest_framework import serializers
+
 from .models import Reservation
-from apps.book_copies.models import BookCopy  # adjust to your actual app/model path
+from .services import library_carries_book
 
 
 class ReservationListSerializer(serializers.ModelSerializer):
-    """(unchanged — used for GET /api/reservations/)"""
+    """Read-only — used for GET /api/reservations/."""
 
     member_name = serializers.CharField(source='member.name', read_only=True)
-    book_copy_barcode = serializers.CharField(source='book_copy.barcode', read_only=True)
+    book_title = serializers.CharField(source='book.title', read_only=True)
+    book_copy_barcode = serializers.CharField(source='book_copy.barcode', read_only=True, default=None)
+    queue_position = serializers.SerializerMethodField()
 
     class Meta:
         model = Reservation
         fields = [
-            'id', 'book_copy', 'book_copy_barcode', 'member', 'member_name',
-            'status', 'reserved_at', 'expires_at',
+            'id', 'book', 'book_title', 'library', 'book_copy', 'book_copy_barcode',
+            'member', 'member_name', 'status', 'reserved_at', 'expires_at', 'queue_position',
         ]
         read_only_fields = fields
+
+    def get_queue_position(self, obj):
+        return obj.queue_position()
 
 
 class ReservationCreateSerializer(serializers.ModelSerializer):
     """
-    Serializer for POST /api/reservations/ (creating a new reservation).
+    POST /api/reservations/
+
+    Only `book` and `member` are client-supplied. `library` is injected
+    by the view from the requesting staff member's OWN library (see
+    ReservationListCreateView.perform_create) — never trusted from the
+    request body, so a staff user can't place a reservation against
+    another library's stock. Every reservation starts 'waiting', with
+    no copy assigned — identical for every request, server-controlled.
     """
 
     class Meta:
         model = Reservation
-        fields = ['id', 'book_copy', 'member', 'expires_at']
+        fields = ['id', 'book', 'member']
         read_only_fields = ['id']
 
-    def validate(self, attrs):
-        book_copy = attrs['book_copy']
+    def create(self, validated_data):
+        # `library` arrives here via the view's serializer.save(library=...)
+        # call — DRF merges .save() kwargs into validated_data for create().
+        library = validated_data['library']
+        book = validated_data['book']
 
-        # Business rule: you can only reserve a copy that's currently
-        # available. We compare against BookCopy.STATUS_AVAILABLE
-        # (rather than the raw string 'available') so this stays in
-        # sync automatically if that constant's value ever changes.
-        if book_copy.status != BookCopy.STATUS_AVAILABLE:
+        if not library_carries_book(library, book):
             raise serializers.ValidationError({
-                'book_copy': f"This copy is not available for reservation "
-                              f"(current status: '{book_copy.get_status_display()}')."
+                'book': 'This library does not carry any copies of this book.'
             })
 
-        if not attrs.get('expires_at'):
-            attrs['expires_at'] = timezone.now() + timedelta(days=3)
-
-        return attrs
-
-    def create(self, validated_data):
-        book_copy = validated_data['book_copy']
-
-        # Flip the copy to 'reserved' so it can't be grabbed by
-        # someone else while this reservation is pending.
-        book_copy.status = BookCopy.STATUS_RESERVED
-        book_copy.save(update_fields=['status'])
-
-        reservation = Reservation.objects.create(
-            book_copy=book_copy,
+        return Reservation.objects.create(
+            book=book,
+            library=library,
             member=validated_data['member'],
-            status=Reservation.STATUS_RESERVED,
+            status=Reservation.STATUS_WAITING,
             reserved_at=timezone.now(),
-            expires_at=validated_data['expires_at'],
         )
-        return reservation

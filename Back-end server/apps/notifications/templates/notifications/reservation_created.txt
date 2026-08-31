@@ -1,0 +1,8 @@
+Dear {{ member.name }},
+
+Your reservation for {{ book_title }} has been successfully placed and is currently awaiting availability.
+
+We will notify you once the book is ready for collection.
+
+Kind regards,
+Library Team

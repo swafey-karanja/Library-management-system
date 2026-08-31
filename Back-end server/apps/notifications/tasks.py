@@ -403,3 +403,198 @@ def send_overdue_reminders():
             ],
             ignore_conflicts=True,
         )
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_reservation_created_email(self, reservation_id):
+    """One reservation per call — fired once, right after creation."""
+    from apps.reservations.models import Reservation
+
+    try:
+        reservation = Reservation.objects.select_related('member', 'book').get(id=reservation_id)
+    except Reservation.DoesNotExist:
+        logger.warning("send_reservation_created_email: reservation %s no longer exists", reservation_id)
+        return
+
+    member = reservation.member
+    if not member.email:
+        logger.info("send_reservation_created_email: member %s has no email on file, skipping", member.member_id)
+        return
+
+    try:
+        _send_email(
+            subject="Your reservation has been placed",
+            template_base="reservation_created",
+            context={"member": member, "book_title": reservation.book.title},
+            to_email=member.email,
+        )
+    except Exception as exc:
+        logger.exception("send_reservation_created_email failed for reservation %s", reservation_id)
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_reservation_cancelled_email(self, reservation_id):
+    from apps.reservations.models import Reservation
+
+    try:
+        reservation = Reservation.objects.select_related('member', 'book').get(id=reservation_id)
+    except Reservation.DoesNotExist:
+        logger.warning("send_reservation_cancelled_email: reservation %s no longer exists", reservation_id)
+        return
+
+    member = reservation.member
+    if not member.email:
+        logger.info("send_reservation_cancelled_email: member %s has no email on file, skipping", member.member_id)
+        return
+
+    try:
+        _send_email(
+            subject="Your reservation has been cancelled",
+            template_base="reservation_cancelled",
+            context={"member": member, "book_title": reservation.book.title},
+            to_email=member.email,
+        )
+    except Exception as exc:
+        logger.exception("send_reservation_cancelled_email failed for reservation %s", reservation_id)
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_reservation_ready_email(self, reservation_id):
+    """Fired once, at the moment a copy is assigned to the reservation."""
+    from apps.reservations.models import Reservation
+
+    try:
+        reservation = Reservation.objects.select_related('member', 'book').get(id=reservation_id)
+    except Reservation.DoesNotExist:
+        logger.warning("send_reservation_ready_email: reservation %s no longer exists", reservation_id)
+        return
+
+    member = reservation.member
+    if not member.email:
+        logger.info("send_reservation_ready_email: member %s has no email on file, skipping", member.member_id)
+        return
+
+    if not reservation.expires_at:
+        logger.warning("send_reservation_ready_email: reservation %s has no expires_at set", reservation_id)
+        return
+
+    try:
+        _send_email(
+            subject="Your reserved book is ready for collection",
+            template_base="reservation_ready",
+            context={
+                "member": member,
+                "book_title": reservation.book.title,
+                "reservation_expiry_date": reservation.expires_at,
+            },
+            to_email=member.email,
+        )
+    except Exception as exc:
+        logger.exception("send_reservation_ready_email failed for reservation %s", reservation_id)
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_reservation_expired_email(self, reservation_id):
+    from apps.reservations.models import Reservation
+
+    try:
+        reservation = Reservation.objects.select_related('member', 'book').get(id=reservation_id)
+    except Reservation.DoesNotExist:
+        logger.warning("send_reservation_expired_email: reservation %s no longer exists", reservation_id)
+        return
+
+    member = reservation.member
+    if not member.email:
+        logger.info("send_reservation_expired_email: member %s has no email on file, skipping", member.member_id)
+        return
+
+    try:
+        _send_email(
+            subject="Your reservation has expired",
+            template_base="reservation_expired",
+            context={"member": member, "book_title": reservation.book.title},
+            to_email=member.email,
+        )
+    except Exception as exc:
+        logger.exception("send_reservation_expired_email failed for reservation %s", reservation_id)
+        raise self.retry(exc=exc)
+
+
+@shared_task
+def send_reservation_reminders():
+    """
+    Runs once daily (see CELERY_BEAT_SCHEDULE). Finds every reservation
+    currently 'reserved' (copy assigned, awaiting pickup) that hasn't
+    expired yet, and reminds the member. Deduped via NotificationLog's
+    new reservation_id field, same shape/reasoning as
+    send_due_soon_reminders/send_overdue_reminders above — a Beat
+    misfire/retry within the same day can't double-send.
+    """
+    from apps.reservations.models import Reservation
+    from .models import NotificationLog
+
+    now = timezone.now()
+    today = now.date()
+
+    pending_reservations = list(
+        Reservation.objects.select_related('member', 'book').filter(
+            status=Reservation.STATUS_RESERVED,
+            expires_at__gte=now,
+        )
+    )
+    if not pending_reservations:
+        return 'No pending reservations to remind.'
+
+    already_sent = set(
+        NotificationLog.objects.filter(
+            notification_type=NotificationLog.TYPE_RESERVATION_REMINDER,
+            sent_for_date=today,
+            reservation_id__in=[r.id for r in pending_reservations],
+        ).values_list('reservation_id', flat=True)
+    )
+    pending = [r for r in pending_reservations if r.id not in already_sent]
+    if not pending:
+        return 'No pending reservations to remind (already sent today).'
+
+    sent_count = 0
+    logged_ids = []
+
+    for reservation in pending:
+        member = reservation.member
+        if not member.email:
+            logger.info("send_reservation_reminders: member %s has no email on file, skipping", member.member_id)
+            continue
+
+        try:
+            _send_email(
+                subject="Reminder: your reserved book is waiting for collection",
+                template_base="reservation_reminder",
+                context={
+                    "member": member,
+                    "book_title": reservation.book.title,
+                    "reservation_expiry_date": reservation.expires_at,
+                },
+                to_email=member.email,
+            )
+        except Exception:
+            logger.exception("send_reservation_reminders failed for reservation %s", reservation.id)
+            continue
+
+        logged_ids.append(reservation.id)
+        sent_count += 1
+
+    NotificationLog.objects.bulk_create(
+        [
+            NotificationLog(
+                reservation_id=reservation_id,
+                notification_type=NotificationLog.TYPE_RESERVATION_REMINDER,
+                sent_for_date=today,
+            )
+            for reservation_id in logged_ids
+        ],
+        ignore_conflicts=True,
+    )
+
+    return f"Sent {sent_count} reservation reminder email(s)."

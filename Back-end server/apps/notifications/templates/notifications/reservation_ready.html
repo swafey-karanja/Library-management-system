@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: sans-serif; color: #222;">
+  <p>Dear {{ member.name }},</p>
+  <p>A copy of <strong>{{ book_title }}</strong> is now available and has been reserved for you.</p>
+  <p>Kindly arrange to collect it before <strong>{{ reservation_expiry_date|date:"d F Y" }}</strong> to avoid the reservation expiring.</p>
+  <p>Kind regards,<br>Library Team</p>
+</body>
+</html>

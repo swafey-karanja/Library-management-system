@@ -1,0 +1,8 @@
+Dear {{ member.name }},
+
+A copy of {{ book_title }} is now available and has been reserved for you.
+
+Kindly arrange to collect it before {{ reservation_expiry_date|date:"d F Y" }} to avoid the reservation expiring.
+
+Kind regards,
+Library Team

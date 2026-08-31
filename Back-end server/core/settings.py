@@ -318,4 +318,8 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'reservations.expire_reservations',  # matches name= above
         'schedule': crontab(minute='*/15'),
     },
+    'send-reservation-reminders-daily': {
+        'task': 'apps.notifications.tasks.send_reservation_reminders',
+        'schedule': crontab(hour=9, minute=0),
+    },
 }

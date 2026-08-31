@@ -1,0 +1,8 @@
+Dear {{ member.name }},
+
+Your reservation for {{ book_title }} has expired because the reservation hold period has ended.
+
+The reserved copy has now been released and is available for other members.
+
+Kind regards,
+Library Team

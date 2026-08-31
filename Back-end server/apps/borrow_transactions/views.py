@@ -43,6 +43,7 @@ from .serializers import (
     BULK_UPDATABLE_FIELDS,
 )
 from .notifications import notify_checkout, notify_return, notify_update, NOTIFIABLE_FIELDS
+from apps.reservations.services import assign_or_release_book_copy, close_matching_reservation
 
 # ORM path from BorrowTransaction down to a library id. This model has
 # no direct `library` FK (see models.py) — it's scoped through the
@@ -58,17 +59,16 @@ class BorrowTransactionPagination(PageNumberPagination):
 
 
 def _sync_book_copy_status(borrow_transaction):
-    """
-    Keeps the linked BookCopy's status consistent with a transaction's
-    status. Used by the correction endpoints below (single + bulk
-    update), which take status as raw input rather than deriving it
-    from a specific action like checkout/return do.
-    """
     book_copy = borrow_transaction.book_copy
+
+    if borrow_transaction.status == BorrowTransaction.STATUS_RETURNED:
+        if book_copy.status != book_copy.STATUS_AVAILABLE:
+            assign_or_release_book_copy(book_copy)
+        return
+
     status_map = {
         BorrowTransaction.STATUS_ACTIVE: book_copy.STATUS_BORROWED,
         BorrowTransaction.STATUS_OVERDUE: book_copy.STATUS_BORROWED,
-        BorrowTransaction.STATUS_RETURNED: book_copy.STATUS_AVAILABLE,
         BorrowTransaction.STATUS_LOST: book_copy.STATUS_LOST,
     }
     new_copy_status = status_map.get(borrow_transaction.status)
@@ -377,6 +377,8 @@ class BorrowCheckoutView(APIView):
             book_copy.status = book_copy.STATUS_BORROWED
             book_copy.save(update_fields=['status'])
 
+            close_matching_reservation(member, book_copy)  # NEW
+
             notify_checkout([borrow_transaction.id])
 
         output_serializer = BorrowTransactionSerializer(borrow_transaction)
@@ -487,6 +489,8 @@ class BorrowBatchCheckoutView(APIView):
                 copy.status = copy.STATUS_BORROWED
                 copy.save(update_fields=['status'])
 
+                close_matching_reservation(member, copy)
+
                 created_transactions.append(borrow_transaction)
 
         notify_checkout([txn.id for txn in created_transactions])
@@ -538,10 +542,15 @@ class BorrowReturnView(APIView):
             condition = data.get('condition')
             if condition:
                 book_copy.condition = condition
-            book_copy.status = (
-                book_copy.STATUS_DAMAGED if condition == book_copy.CONDITION_DAMAGED
-                else book_copy.STATUS_AVAILABLE
-            )
+                book_copy.save(update_fields=['condition'])
+
+            if condition == book_copy.CONDITION_DAMAGED:
+                book_copy.status = book_copy.STATUS_DAMAGED
+                book_copy.save(update_fields=['status'])
+            else:
+                # Never call assign_or_release_book_copy for a damaged
+                # copy — only reaches here when it's genuinely returnable.
+                assign_or_release_book_copy(book_copy)
             book_copy.save(update_fields=['status', 'condition'])
 
         notify_return([borrow_transaction.id])
@@ -628,10 +637,13 @@ class BorrowBatchReturnView(APIView):
                 condition = item.get('condition')
                 if condition:
                     book_copy.condition = condition
-                book_copy.status = (
-                    book_copy.STATUS_DAMAGED if condition == book_copy.CONDITION_DAMAGED
-                    else book_copy.STATUS_AVAILABLE
-                )
+                    book_copy.save(update_fields=['condition'])
+
+                if condition == book_copy.CONDITION_DAMAGED:
+                    book_copy.status = book_copy.STATUS_DAMAGED
+                    book_copy.save(update_fields=['status'])
+                else:
+                    assign_or_release_book_copy(book_copy)
                 book_copy.save(update_fields=['status', 'condition'])
 
                 returned_transactions.append(borrow_transaction)

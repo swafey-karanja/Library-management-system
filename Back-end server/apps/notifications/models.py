@@ -40,48 +40,62 @@ from django.db import models
 class NotificationLog(models.Model):
     TYPE_DUE_SOON = "due_soon"
     TYPE_OVERDUE = "overdue"
+    TYPE_RESERVATION_REMINDER = "reservation_reminder"  # NEW
 
     TYPE_CHOICES = [
         (TYPE_DUE_SOON, "Due Soon"),
         (TYPE_OVERDUE, "Overdue"),
+        (TYPE_RESERVATION_REMINDER, "Reservation Reminder"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
-    # Plain UUIDField rather than a ForeignKey to BorrowTransaction -
-    # this table's only job is "was X reminded about Y on date Z", it
-    # doesn't need Django to enforce a real relation or let us
-    # traverse it ORM-style. Keeps this app decoupled from having to
-    # import borrow_transactions models at the model-definition level
-    # (tasks.py already does its BorrowTransaction imports lazily,
-    # inside functions, for the same reason - avoids app-loading-order
-    # issues between apps.notifications and apps.borrow_transactions).
-    borrow_transaction_id = models.UUIDField(db_index=True)
+    # CHANGED: null=True, blank=True — a row now logs EITHER a
+    # borrow_transaction reminder OR a reservation reminder, never both.
+    borrow_transaction_id = models.UUIDField(db_index=True, null=True, blank=True)
 
-    notification_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    # NEW — same "plain UUIDField, not a real FK" reasoning as
+    # borrow_transaction_id: keeps this app decoupled from importing
+    # reservations models at load time.
+    reservation_id = models.UUIDField(db_index=True, null=True, blank=True)
 
-    # See the module docstring above - meaning of this field differs
-    # by notification_type.
+    notification_type = models.CharField(max_length=30, choices=TYPE_CHOICES)
     sent_for_date = models.DateField()
-
     sent_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = "notification_log"
         constraints = [
+            # Split into two CONDITIONAL unique constraints instead of
+            # one combined one — a reservation-reminder row has
+            # borrow_transaction_id=NULL, and Postgres treats NULL as
+            # distinct from any other NULL in a plain unique
+            # constraint anyway, but being explicit here makes the
+            # intent clear rather than relying on that NULL quirk.
             models.UniqueConstraint(
                 fields=["borrow_transaction_id", "notification_type", "sent_for_date"],
                 name="uniq_notification_per_transaction_type_date",
-            )
+                condition=models.Q(borrow_transaction_id__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=["reservation_id", "notification_type", "sent_for_date"],
+                name="uniq_notification_per_reservation_type_date",
+                condition=models.Q(reservation_id__isnull=False),
+            ),
         ]
         indexes = [
             models.Index(
                 fields=["borrow_transaction_id", "notification_type", "sent_for_date"],
                 name="idx_notification_dedup_lookup",
             ),
+            models.Index(
+                fields=["reservation_id", "notification_type", "sent_for_date"],
+                name="idx_notif_reservation_dedup",
+            ),
         ]
         verbose_name = "Notification Log Entry"
         verbose_name_plural = "Notification Log Entries"
 
     def __str__(self):
-        return f"{self.notification_type} for {self.borrow_transaction_id} on {self.sent_for_date}"
+        target = self.borrow_transaction_id or self.reservation_id
+        return f"{self.notification_type} for {target} on {self.sent_for_date}"

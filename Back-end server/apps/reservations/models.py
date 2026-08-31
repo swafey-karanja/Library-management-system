@@ -4,53 +4,82 @@ from django.db import models
 
 class Reservation(models.Model):
     """
-    Maps to the existing `reservations` table in PostgreSQL.
+    Maps to the `reservations` table in PostgreSQL.
 
-    A Reservation represents a member "holding" a specific physical
-    copy of a book (book_copy) until they collect it or it expires.
+    A Reservation is BOOK-level, not copy-level: it represents "this
+    member wants a copy of this book from this library", and only gets
+    tied to one specific physical book_copy once one is actually
+    assigned to it (status transitions from 'waiting' to 'reserved').
+    This is a deliberate redesign from the original copy-level model —
+    see the project's design notes for the full reasoning.
     """
 
-    # --- Status choices -------------------------------------------------
-    # Django's `choices` doesn't create a DB-level CHECK constraint on its
-    # own — your table already has one in SQL. This just gives us
-    # validation on the Python/DRF side and nice labels in the admin/API.
+    # --- Status choices ---------------------------------------------
+    # 'waiting'     -> created, no copy assigned yet ("please let me
+    #                  know when a copy of this book is free")
+    # 'reserved'    -> a copy HAS been assigned and the member notified
+    #                  ("this specific copy is being held for you")
+    # 'checked_out' -> member came in and collected the held copy
+    # 'cancelled'   -> member/staff cancelled while waiting or reserved
+    # 'expired'     -> hold period passed without pickup (only ever
+    #                  applies to a 'reserved' reservation)
+    STATUS_WAITING = 'waiting'
     STATUS_RESERVED = 'reserved'
     STATUS_CHECKED_OUT = 'checked_out'
     STATUS_CANCELLED = 'cancelled'
     STATUS_EXPIRED = 'expired'
 
     STATUS_CHOICES = [
+        (STATUS_WAITING, 'Waiting'),
         (STATUS_RESERVED, 'Reserved'),
         (STATUS_CHECKED_OUT, 'Checked Out'),
         (STATUS_CANCELLED, 'Cancelled'),
         (STATUS_EXPIRED, 'Expired'),
     ]
 
-    # --- Fields -----------------------------------------------------------
-    # `primary_key=True` tells Django this is the PK, matching `id UUID PRIMARY KEY`.
-    # `default=uuid.uuid4` means Django can generate one client-side if we ever
-    # create a Reservation via the ORM. It doesn't override the DB's
-    # `gen_random_uuid()` default — that only kicks in if Django sends no value.
-    id = models.UUIDField(
-        primary_key=True,
-        default=uuid.uuid4,
-        editable=False,
-        db_column='id',
+    # How many days a member has to collect a copy once it's assigned
+    # to them (waiting -> reserved). The clock starts at assignment,
+    # not at original reservation creation.
+    HOLD_PERIOD_DAYS = 3
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, db_column='id')
+
+    # NEW — which book this reservation is for. Book-level, not
+    # copy-level: this is what lets the reservation exist BEFORE any
+    # specific copy is free.
+    book = models.ForeignKey(
+        'books.Book',
+        on_delete=models.CASCADE,
+        db_column='book_id',
+        related_name='reservations',
     )
 
-    # ForeignKey to BookCopy. Adjust 'books.BookCopy' to match whatever
-    # app/model name you used for the book_copies table.
-    # db_column tells Django the actual column name in Postgres is
-    # `book_copy_id`, since Django would otherwise guess `book_copy_id_id`
-    # (it appends `_id` automatically to FK field names).
+    # NEW — which library's stock this reservation watches. Required
+    # because the same book title can exist in multiple libraries'
+    # catalogs (multi-tenant system) — without this, "a copy of this
+    # book became available" would be ambiguous about WHICH library's
+    # copy it means.
+    library = models.ForeignKey(
+        'libraries.Library',
+        on_delete=models.CASCADE,
+        db_column='library_id',
+        related_name='reservations',
+    )
+
+    # CHANGED — nullable now (was NOT NULL). NULL while status is
+    # 'waiting'; populated only when a matching copy is actually
+    # assigned. on_delete changed from CASCADE to SET_NULL: if the
+    # assigned copy is later removed (lost/withdrawn), the reservation
+    # should fall back to waiting for a different copy, not vanish.
     book_copy = models.ForeignKey(
         'book_copies.BookCopy',
-        on_delete=models.CASCADE,   # mirrors "ON DELETE CASCADE" in SQL
+        on_delete=models.SET_NULL,
         db_column='book_copy_id',
-        related_name='reservations',  # lets you do book_copy.reservations.all()
+        related_name='reservations',
+        null=True,
+        blank=True,
     )
 
-    # ForeignKey to Member. Adjust 'members.Member' to your actual app/model name.
     member = models.ForeignKey(
         'members.Member',
         on_delete=models.CASCADE,
@@ -58,42 +87,53 @@ class Reservation(models.Model):
         related_name='reservations',
     )
 
-    status = models.CharField(
-        max_length=30,
-        choices=STATUS_CHOICES,
-        default=STATUS_RESERVED,
-    )
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default=STATUS_WAITING)
 
-    # These have DB-side defaults (CURRENT_TIMESTAMP), so we allow them
-    # to be blank/null from Django's perspective — Postgres fills them in
-    # if we don't supply a value on INSERT.
+    # When the reservation was first PLACED (unchanged meaning).
     reserved_at = models.DateTimeField(blank=True, null=True)
+
+    # CHANGED meaning — NULL until a copy is actually assigned. Only
+    # set at the waiting->reserved transition, to "now + HOLD_PERIOD_DAYS".
     expires_at = models.DateTimeField(blank=True, null=True)
 
     class Meta:
-        managed = False          # Django will NOT create/alter/drop this table
-        db_table = 'reservations'  # exact table name in Postgres
-        ordering = ['-reserved_at']  # default ordering when you query .all()
+        managed = False
+        db_table = 'reservations'
+        ordering = ['-reserved_at']
         verbose_name = 'Reservation'
         verbose_name_plural = 'Reservations'
 
-        # --- Indexes -------------------------------------------------
-        # These MIRROR the indexes already created by the raw SQL below.
-        # Because managed=False, Django will NOT emit CREATE INDEX
-        # statements for these — they're purely documentation/metadata
-        # here. Keeping them in sync with the SQL is a manual discipline,
-        # not something Django enforces for unmanaged models.
-        #
-        #   CREATE INDEX idx_reservation_book_id   ON reservations(book_copy_id);
-        #   CREATE INDEX idx_reservation_member_id ON reservations(member_id);
-        #   CREATE INDEX idx_reservation_status     ON reservations(status);
+        # Documentation only (managed=False) — mirrors the indexes
+        # created via the raw SQL below.
         indexes = [
             models.Index(fields=['book_copy'], name='idx_reservation_book_id'),
             models.Index(fields=['member'], name='idx_reservation_member_id'),
             models.Index(fields=['status'], name='idx_reservation_status'),
+            # Serves expire_reservations' query: status='reserved' AND expires_at < now.
+            models.Index(fields=['status', 'expires_at'], name='idx_reservation_status_exp'),
+            # Serves fulfillment's query: oldest 'waiting' reservation
+            # for a given (library, book) — equality columns first,
+            # sort column (reserved_at) last, matching the query shape.
+            models.Index(fields=['library', 'book', 'status', 'reserved_at'], name='idx_reservation_fulfill'),
         ]
 
     def __str__(self):
-        # Used by Django admin and debugging — makes objects readable
-        # instead of printing "Reservation object (1)".
         return f"Reservation {self.id} ({self.status})"
+
+    def queue_position(self):
+        """
+        1-based position of this reservation among all still-'waiting'
+        reservations for the same (library, book), ordered by
+        reserved_at. Computed on read, not stored — it naturally shifts
+        as reservations ahead of it get fulfilled or cancelled. Only
+        meaningful while status='waiting'; returns None otherwise.
+        """
+        if self.status != self.STATUS_WAITING:
+            return None
+        earlier_count = Reservation.objects.filter(
+            library=self.library,
+            book=self.book,
+            status=self.STATUS_WAITING,
+            reserved_at__lt=self.reserved_at,
+        ).count()
+        return earlier_count + 1

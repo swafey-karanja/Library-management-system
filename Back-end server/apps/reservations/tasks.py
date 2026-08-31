@@ -3,34 +3,24 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import Reservation
-from book_copies.models import BookCopy  # adjust import path if different
+from .services import assign_or_release_book_copy
+from .notifications import notify_reservation_expired
 
 
 @shared_task(name='reservations.expire_reservations')
 def expire_reservations():
     """
-    Celery task: expire_reservations
+    Finds every reservation still in 'reserved' status (a copy WAS
+    assigned, member notified) whose expires_at has passed, and
+    expires it.
 
-    Finds every reservation that is still marked 'reserved' but whose
-    `expires_at` has passed, and:
-        1. Flips its status to 'expired'
-        2. Frees up the associated book copy back to 'available'
-           so it can be reserved or borrowed by someone else.
-
-    `@shared_task` (rather than `@app.task`) is used so this task
-    doesn't need to import your specific Celery app instance directly —
-    it attaches itself to whichever app is configured when Django
-    starts. This is the recommended pattern for tasks defined inside
-    reusable apps.
-
-    `name=` sets an explicit, stable task name. Without it, Celery
-    infers the name from the module path (e.g.
-    'reservations.tasks.expire_reservations'), which would silently
-    change if you ever move/rename this file — an explicit name avoids
-    that breaking your Celery Beat schedule.
-
-    Returns a short summary string, which Celery stores as the task's
-    result (visible in Flower/monitoring tools, or if you chain tasks).
+    CHANGED from the original version: the freed copy is now handed to
+    the NEXT waiting reservation for the same book, if one exists —
+    via assign_or_release_book_copy(), the SAME function the return
+    flow uses. Without this, an expired hold would just sit at
+    'available' indefinitely even if other members are waiting, since
+    this copy isn't "out on loan" — nothing would trigger fulfillment
+    for it again until some unrelated future return.
     """
     now = timezone.now()
 
@@ -45,20 +35,19 @@ def expire_reservations():
     expired_count = 0
 
     for reservation in expired_reservations:
-        # Each reservation's two related writes (Reservation + BookCopy)
-        # are wrapped in their own transaction, so one reservation's
-        # failure doesn't roll back or block the others.
         with transaction.atomic():
+            book_copy = reservation.book_copy
+
             reservation.status = Reservation.STATUS_EXPIRED
             reservation.save(update_fields=['status'])
 
-            book_copy = reservation.book_copy
-            # Defensive check: only free the copy if it's still
-            # 'reserved' — something else may have already changed its
-            # status (e.g. marked 'lost' by a librarian in the meantime).
-            if book_copy.status == BookCopy.STATUS_RESERVED:
-                book_copy.status = BookCopy.STATUS_AVAILABLE
-                book_copy.save(update_fields=['status'])
+            # Defensive: only touch the copy if it's still actually
+            # sitting 'reserved' — a librarian could have manually
+            # changed it (e.g. marked lost/damaged) in the meantime.
+            if book_copy is not None and book_copy.status == book_copy.STATUS_RESERVED:
+                assign_or_release_book_copy(book_copy)
+
+            notify_reservation_expired(reservation.id)
 
         expired_count += 1
 
