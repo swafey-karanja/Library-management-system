@@ -49,19 +49,18 @@ class ReservationListCreateView(LibraryScopedQuerysetMixin, generics.ListCreateA
         # requesting staff member's own library. See the flagged note
         # below on request.user.library.
         reservation = serializer.save(library=self.request.user.library)
-        notify_reservation_created(reservation.id)
 
 
 class ReservationCancelView(APIView):
     """
     POST /api/reservations/<uuid:pk>/cancel/
 
-    Cancels a reservation that's still 'waiting' or 'reserved'. If a
-    copy had already been claimed for it (status='reserved'), that
-    copy is released straight to 'available' — this does NOT
-    immediately try to hand it to the next waiting reservation (see
-    flagged note below); the next actual RETURN will trigger
-    fulfillment normally.
+    If a copy had already been claimed for this reservation
+    (status='reserved'), cancelling it now hands that copy straight to
+    the NEXT oldest waiting reservation for the same book, if one
+    exists — reusing the same assign_or_release_book_copy() function
+    the return flow uses, instead of just dropping it back to plain
+    'available' and waiting for an unrelated future return to notice.
     """
     permission_classes = [IsAdminOrLibrarian]
 
@@ -87,11 +86,7 @@ class ReservationCancelView(APIView):
             reservation.status = Reservation.STATUS_CANCELLED
             reservation.save(update_fields=['status'])
 
-            # if book_copy is not None:
-            #     book_copy.status = book_copy.STATUS_AVAILABLE
-            #     book_copy.save(update_fields=['status'])
-
-            if book_copy is not None and book_copy.status == book_copy.STATUS_RESERVED:
+            if book_copy is not None:
                 assign_or_release_book_copy(book_copy)
 
             notify_reservation_cancelled(reservation.id)

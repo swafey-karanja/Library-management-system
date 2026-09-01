@@ -2,7 +2,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from .models import Reservation
-from .services import library_carries_book
+from .services import library_carries_book, create_reservation
 
 
 class ReservationListSerializer(serializers.ModelSerializer):
@@ -47,16 +47,11 @@ class ReservationCreateSerializer(serializers.ModelSerializer):
         # call — DRF merges .save() kwargs into validated_data for create().
         library = validated_data['library']
         book = validated_data['book']
+        member = validated_data['member']
 
         if not library_carries_book(library, book):
             raise serializers.ValidationError({
                 'book': 'This library does not carry any copies of this book.'
             })
 
-        return Reservation.objects.create(
-            book=book,
-            library=library,
-            member=validated_data['member'],
-            status=Reservation.STATUS_WAITING,
-            reserved_at=timezone.now(),
-        )
+        return create_reservation(library=library, book=book, member=member)

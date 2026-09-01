@@ -14,8 +14,8 @@ from datetime import timedelta
 from django.utils import timezone
 
 from .models import Reservation
-from .notifications import notify_reservation_ready
-
+from django.db import transaction
+from .notifications import notify_reservation_created, notify_reservation_ready
 
 def library_carries_book(library, book):
     """
@@ -28,6 +28,69 @@ def library_carries_book(library, book):
     from apps.book_copies.models import BookCopy
     return BookCopy.objects.filter(library=library, book=book).exists()
 
+def claim_available_copy(library, book):
+    """
+    Locks and returns one currently-available book_copy of `book` at
+    `library`, if one exists. Used at RESERVATION CREATION time to
+    check whether a copy is already sitting on the shelf, so a member
+    doesn't get stuck 'waiting' unnecessarily when something's already
+    free. Returns None if nothing's available.
+
+    Must be called inside an existing transaction.atomic() block —
+    select_for_update() requires one. Locking here (not just reading)
+    matters: it stops two reservation requests for the SAME last
+    available copy racing each other and both trying to claim it.
+    """
+    from apps.book_copies.models import BookCopy
+    return (
+        BookCopy.objects
+        .select_for_update()
+        .filter(library=library, book=book, status=BookCopy.STATUS_AVAILABLE)
+        .order_by('id')
+        .first()
+    )
+
+def create_reservation(library, book, member):
+    """
+    The ONLY place a Reservation should be created from — guarantees
+    the right status, side effects, and notification all happen
+    together, atomically:
+
+      - If a copy is available right now, the reservation is created
+        ALREADY 'reserved' against that copy (skips 'waiting'
+        entirely), the copy is claimed, expires_at is set, and the
+        "ready for pickup" email fires — not the "created" email,
+        since sending both back-to-back would be redundant/confusing.
+      - Otherwise, the reservation is created 'waiting', with the
+        "reservation created / awaiting availability" email.
+    """
+    with transaction.atomic():
+        available_copy = claim_available_copy(library, book)
+
+        if available_copy is not None:
+            reservation = Reservation.objects.create(
+                book=book,
+                library=library,
+                member=member,
+                status=Reservation.STATUS_RESERVED,
+                reserved_at=timezone.now(),
+                book_copy=available_copy,
+                expires_at=timezone.now() + timedelta(days=Reservation.HOLD_PERIOD_DAYS),
+            )
+            available_copy.status = available_copy.STATUS_RESERVED
+            available_copy.save(update_fields=['status'])
+            notify_reservation_ready(reservation.id)
+        else:
+            reservation = Reservation.objects.create(
+                book=book,
+                library=library,
+                member=member,
+                status=Reservation.STATUS_WAITING,
+                reserved_at=timezone.now(),
+            )
+            notify_reservation_created(reservation.id)
+
+    return reservation
 
 def assign_or_release_book_copy(book_copy):
     """
