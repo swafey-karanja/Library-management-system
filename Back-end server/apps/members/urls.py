@@ -6,7 +6,9 @@ from .views import (
     MemberStatisticsView,
     MemberExportView,
     MemberImportView,
-    MemberBulkUpdateView
+    MemberBulkUpdateView,
+    MemberActivationView,
+    ResendMemberActivationView,
 )
 
 urlpatterns = [
@@ -17,4 +19,14 @@ urlpatterns = [
     path("stats/", MemberStatisticsView.as_view(), name="member-statistics"),
     path("export/", MemberExportView.as_view(), name="export-members"),
     path("import/", MemberImportView.as_view(), name="import-members"),
+    # Email confirmation (unauthenticated — a brand-new member confirming
+    # their address, they don't have login credentials at this point).
+    path("activate/", MemberActivationView.as_view(), name="member-activate"),
+    # Admin/librarian trigger to resend the confirmation email if the
+    # original 24-hour link expired.
+    path(
+        "<uuid:member_id>/resend-activation/",
+        ResendMemberActivationView.as_view(),
+        name="member-resend-activation",
+    ),
 ]

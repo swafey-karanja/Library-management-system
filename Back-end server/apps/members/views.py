@@ -1,17 +1,24 @@
 import csv
+import uuid
+import hashlib
+from datetime import timedelta
 
+from django.conf import settings
 from django.db.models import Count
 from django.http import HttpResponse
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import generics, filters, status as http_status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import MultiPartParser
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Member, Status, Gender, MembershipType
-from .serializers import MemberSerializer
+from .models import Member, MemberActivationToken, Status, Gender, MembershipType
+from .serializers import MemberSerializer, MemberActivationSerializer
 from .filters import MemberFilter
+from .emails import send_member_welcome_email, send_member_active_email
 from core.permissions import (
     # IsAdminUser,
     IsAdminOrLibrarian,
@@ -85,12 +92,90 @@ class MemberListView(generics.ListAPIView):
         return queryset
 
 
+def _send_member_activation(member):
+    """
+    Creates a MemberActivationToken for the given member and emails them
+    the welcome / "please confirm your email" message.
+
+    Pulled out into its own module-level function (rather than being
+    inlined into MemberCreateView) for the same reason apps/users/views.py
+    does the equivalent thing with _send_activation(): it needs to be
+    callable from more than one place — here, that's the create view AND
+    ResendMemberActivationView below, so a librarian can re-trigger the
+    email if the original link expired before the member clicked it.
+    """
+    # uuid4() generates a cryptographically random 128-bit value — this is
+    # the raw token that goes out in the email link. We never store this
+    # raw value in the database (see the token_hash comment below).
+    raw_token = str(uuid.uuid4())
+
+    # SHA-256 hash of the raw token. If our database were ever leaked,
+    # an attacker holding only these hashes couldn't reconstruct the raw
+    # tokens (hashing is one-way), so they couldn't activate any accounts.
+    # This is the exact same principle as never storing plaintext passwords.
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+    # If this member already had an unused token from a previous call
+    # (e.g. this is a resend), invalidate it first so only the newest
+    # link actually works — otherwise an old, previously-emailed link
+    # would still be valid alongside the new one.
+    MemberActivationToken.objects.filter(member=member, is_used=False).update(
+        is_used=True
+    )
+
+    MemberActivationToken.objects.create(
+        member=member,
+        token_hash=token_hash,
+        # 24 hours gives the member a reasonable window to check their
+        # inbox without the link staying open indefinitely.
+        expires_at=timezone.now() + timedelta(hours=24),
+    )
+
+    # Build the confirmation URL the FRONTEND is responsible for handling.
+    # The frontend reads uid + token from the querystring and POSTs them
+    # to /api/v1/members/activate/ (MemberActivationView below) — the
+    # backend never renders this page itself.
+    frontend_url = settings.FRONTEND_URL.rstrip("/")
+    confirmation_url = (
+        f"{frontend_url}/members/confirm"
+        f"?uid={member.member_id}"
+        f"&token={raw_token}"
+    )
+
+    send_member_welcome_email(
+        member_name=member.name,
+        library_name=member.library.name,
+        to_email=member.email,
+        confirmation_url=confirmation_url,
+    )
+
+
 class MemberCreateView(generics.CreateAPIView):
-    """POST /members/create/ -> create a member (membership_no auto-generated)"""
+    """
+    POST /members/create/ -> create a member (membership_no auto-generated).
+
+    The member is always created with status "inactive" (enforced in
+    MemberSerializer.create(), not here) and a welcome/confirmation email
+    is fired immediately after the row is saved.
+    """
 
     queryset = Member.objects.all()
     serializer_class = MemberSerializer
     permission_classes = [IsAdminOrLibrarian]
+
+    def perform_create(self, serializer):
+        """
+        `perform_create()` is a hook CreateAPIView calls internally, right
+        where it would normally just do `serializer.save()`. Overriding it
+        (instead of overriding the whole `create()`/`post()` method) means
+        we get to run extra code immediately after the Member is saved,
+        while still letting DRF handle building the 201 response for us.
+
+        `serializer.save()` returns the model instance that was just
+        created — we capture it here so we know exactly who to email.
+        """
+        member = serializer.save()
+        _send_member_activation(member)
 
 
 class MemberUpdateView(generics.UpdateAPIView):
@@ -291,7 +376,11 @@ class MemberImportView(APIView):
 
             serializer = MemberSerializer(data=row)
             if serializer.is_valid():
-                serializer.save()
+                member = serializer.save()
+                # Same as a single create via MemberCreateView: every
+                # imported member starts "inactive" and gets the same
+                # welcome/confirmation email, one per row.
+                _send_member_activation(member)
                 created.append(serializer.data["membership_no"])
             else:
                 errors.append({"row": line_number, "errors": serializer.errors})
@@ -300,4 +389,132 @@ class MemberImportView(APIView):
         return Response(
             {"created_count": len(created), "created": created, "errors": errors},
             status=response_status,
+        )
+
+
+# ---------------------------------------------------------------------------
+# MEMBER EMAIL ACTIVATION
+# POST /api/v1/members/activate/
+#
+# Called by the FRONTEND (not typed directly by the member) once they
+# click the "Confirm my email address" button/link in their welcome email.
+# The frontend reads `uid` and `token` out of the link's querystring and
+# POSTs them here as JSON.
+#
+# permission_classes = [AllowAny] because the member isn't logged in at
+# this point — they don't even have an account/password, just a link.
+# The uid+token pair itself IS the proof of identity for this one action.
+# ---------------------------------------------------------------------------
+class MemberActivationView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = MemberActivationSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=http_status.HTTP_400_BAD_REQUEST)
+
+        uid = serializer.validated_data["uid"]  # type: ignore
+        raw_token = serializer.validated_data["token"]  # type: ignore
+
+        # --- Look up the member ---
+        try:
+            member = Member.objects.get(pk=uid)
+        except Member.DoesNotExist:
+            # Deliberately vague — we don't want to confirm/deny whether a
+            # given uid exists at all to an unauthenticated caller.
+            return Response(
+                {"detail": "Invalid confirmation link."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        # If they're already active, the link was simply clicked twice
+        # (e.g. double-click, or opened in two tabs). Treat that as a
+        # harmless success rather than an error.
+        if member.status == Status.ACTIVE:
+            return Response(
+                {"detail": "This membership has already been confirmed."},
+                status=http_status.HTTP_200_OK,
+            )
+
+        # --- Look up the token by hashing what was submitted ---
+        # We never stored the raw token, only its hash, so to find the
+        # matching row we hash the submitted value the same way and
+        # compare — same principle as checking a password.
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        try:
+            activation_token = MemberActivationToken.objects.get(
+                member=member,
+                token_hash=token_hash,
+            )
+        except MemberActivationToken.DoesNotExist:
+            return Response(
+                {"detail": "Invalid confirmation link."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not activation_token.is_valid():
+            return Response(
+                {
+                    "detail": "This confirmation link has expired. Ask your "
+                    "librarian to resend it."
+                },
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --- Everything checks out: activate the membership ---
+        member.status = Status.ACTIVE
+        member.save(update_fields=["status"])
+
+        # Mark the token as used so this exact link can never be replayed.
+        activation_token.is_used = True
+        activation_token.save(update_fields=["is_used"])
+
+        # Fire the "you're now active" confirmation email. This is a
+        # separate, purely informational email from the original welcome
+        # one — it doesn't ask the member to do anything further.
+        send_member_active_email(
+            member_name=member.name,
+            library_name=member.library.name,
+            membership_no=member.membership_no,
+            to_email=member.email,
+        )
+
+        return Response(
+            {"detail": "Membership confirmed. You are now an active member."},
+            status=http_status.HTTP_200_OK,
+        )
+
+
+# ---------------------------------------------------------------------------
+# RESEND MEMBER ACTIVATION EMAIL
+# POST /api/v1/members/<member_id>/resend-activation/
+#
+# For when the original 24-hour link expired before the member got around
+# to clicking it. Restricted to admin/librarian since it's the library
+# staff who would notice/handle this on the member's behalf (e.g. the
+# member calls the front desk saying "my link doesn't work anymore").
+# ---------------------------------------------------------------------------
+class ResendMemberActivationView(APIView):
+    permission_classes = [IsAdminOrLibrarian]
+
+    def post(self, request, member_id):
+        try:
+            member = Member.objects.get(pk=member_id)
+        except Member.DoesNotExist:
+            return Response(
+                {"detail": "Member not found."}, status=http_status.HTTP_404_NOT_FOUND
+            )
+
+        if member.status == Status.ACTIVE:
+            return Response(
+                {"detail": "This membership is already active."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        _send_member_activation(member)
+
+        return Response(
+            {"detail": "Confirmation email resent successfully."},
+            status=http_status.HTTP_200_OK,
         )

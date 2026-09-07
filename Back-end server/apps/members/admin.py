@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Member
+from .models import Member, MemberActivationToken
 
 
 # Registering a model with Django admin gives you a fully working CRUD
@@ -57,4 +57,20 @@ class MemberAdmin(admin.ModelAdmin):
     )
 
     # Default ordering for the list page — newest libraries first.
+    ordering = ("-created_at",)
+
+
+@admin.register(MemberActivationToken)
+class MemberActivationTokenAdmin(admin.ModelAdmin):
+    """
+    Mostly useful for debugging during development — lets you see in the
+    admin UI whether a token was actually created for a member, whether
+    it's expired, and whether it's already been used, without having to
+    open a database shell.
+    """
+
+    list_display = ("member", "is_used", "expires_at", "created_at")
+    list_filter = ("is_used",)
+    search_fields = ("member__name", "member__email")
+    readonly_fields = ("token_hash", "created_at")
     ordering = ("-created_at",)

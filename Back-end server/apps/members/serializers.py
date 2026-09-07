@@ -1,6 +1,6 @@
 from django.db import IntegrityError, transaction
 from rest_framework import serializers
-from .models import Member
+from .models import Member, Status
 
 
 from django.db.models import Q
@@ -88,6 +88,22 @@ class MemberSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
+        # Force every newly-created member to start out INACTIVE, no
+        # matter what (if anything) the client sent for "status". This is
+        # what makes the email-confirmation flow meaningful: a member only
+        # ever becomes "active" by clicking the link we email them (see
+        # MemberActivationView in views.py) — never by simply being
+        # created, and never by a client passing "status": "active" on
+        # this same request.
+        #
+        # We deliberately do this here in create() rather than relying on
+        # the model's `default=Status.INACTIVE` alone, because a model
+        # default only applies when the field is *omitted* — if a client
+        # explicitly sent "status": "active" in the request body, the
+        # model default would never kick in and would silently let that
+        # through. Setting it here overrides whatever was submitted.
+        validated_data["status"] = Status.INACTIVE
+
         # Auto-generate a per-library membership_no, retrying on
         # collision (e.g. two requests creating a member at once).
         max_attempts = 5
@@ -109,3 +125,21 @@ class MemberSerializer(serializers.ModelSerializer):
         lib_code = str(library.library_id).split("-")[0].upper()
         next_number = Member.objects.filter(library=library).count() + 1 + offset
         return f"{lib_code}-{next_number:06d}"
+
+
+# ---------------------------------------------------------------------------
+# MEMBER EMAIL ACTIVATION SERIALIZER
+# ---------------------------------------------------------------------------
+# `Serializer` (not `ModelSerializer`) because this isn't validating fields
+# on the Member model itself — it's validating the two pieces of data the
+# frontend sends back after the member clicks the link in their welcome
+# email: which member (uid) and proof they own that email (token).
+#
+# Kept intentionally tiny/dumb: this serializer's only job is "are these
+# two fields present and the right shape?". All of the actual security
+# checks (does this token exist, has it expired, has it been used already)
+# happen in MemberActivationView, because they require database lookups
+# and business rules that don't belong in a serializer.
+class MemberActivationSerializer(serializers.Serializer):
+    uid = serializers.UUIDField()
+    token = serializers.CharField()

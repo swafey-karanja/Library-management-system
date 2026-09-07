@@ -8,6 +8,7 @@ see the schema at the top of the project notes).
 
 import uuid
 from django.db import models
+from django.utils import timezone
 
 class Gender:
     MALE = "male"
@@ -145,10 +146,18 @@ class Member(models.Model):
     # --- Status flag ---
     # `status BOOLEAN DEFAULT TRUE`
     # Represents whether the membership is currently active. TRUE = active.
+    #
+    # NOTE ON THE DEFAULT: this used to default to ACTIVE, but new members
+    # now go through an email-confirmation flow (see MemberActivationToken
+    # below and members/emails.py), so every member is created INACTIVE
+    # and only flips to ACTIVE once they click the confirmation link we
+    # email them. This model-level default is really just a safety net —
+    # the create logic in serializers.py forces it explicitly too, so a
+    # client can never sneak in `"status": "active"` on the create request.
     status = models.CharField(
         max_length=10,
         choices=Status.CHOICES,
-        default=Status.ACTIVE,
+        default=Status.INACTIVE,
         db_column="status"
     )
 
@@ -181,3 +190,84 @@ class Member(models.Model):
         # shell, and anywhere else `str(member)` is used. Very useful
         # while debugging.
         return f"{self.name} ({self.membership_no})"
+
+
+# ---------------------------------------------------------------------------
+# MEMBER ACTIVATION TOKEN
+# ---------------------------------------------------------------------------
+# This table does NOT exist in the original hand-written SQL schema — it's
+# managed entirely by Django (note `managed = True` further down, which is
+# actually just the default, so we don't even need to state it). That means
+# after adding this model you must run:
+#
+#       python manage.py makemigrations members
+#       python manage.py migrate
+#
+# so Django actually creates the `member_activation_tokens` table for you.
+#
+# WHY WE NEED THIS:
+# When a member is created (see MemberSerializer.create in serializers.py),
+# their status is forced to "inactive". We don't want just anyone able to
+# flip that to "active" by guessing a member's UUID, so instead we:
+#   1. Generate a random, one-time token.
+#   2. Email the member a link containing their member_id + that raw token.
+#   3. Only store a HASH of the token in the database (same idea as never
+#      storing a plaintext password) — if the DB ever leaked, the hashes
+#      alone couldn't be used to activate accounts.
+#   4. When the member clicks the link, the frontend sends the uid + raw
+#      token back to us. We hash the raw token again and compare it to
+#      what's stored — if it matches, hasn't expired, and hasn't already
+#      been used, we know the request is genuinely coming from someone who
+#      received the email, and we flip status -> active.
+#
+# This mirrors apps.users.models.EmailActivationToken almost exactly —
+# same idea, just scoped to library Members instead of system Users.
+class MemberActivationToken(models.Model):
+
+    # Each token belongs to exactly one member. If the member is ever
+    # deleted, ON DELETE CASCADE (models.CASCADE) removes their leftover
+    # tokens too, so we don't accumulate orphaned rows.
+    member = models.ForeignKey(
+        Member,
+        on_delete=models.CASCADE,
+        related_name="activation_tokens",
+        to_field="member_id",
+        db_column="member_id",
+    )
+
+    # SHA-256 hash (hex string, always 64 characters) of the raw token that
+    # was emailed to the member. unique=True means two tokens can never
+    # accidentally collide on the same hash.
+    token_hash = models.CharField(max_length=255, unique=True)
+
+    # After this timestamp the token can no longer be used, even if it's
+    # otherwise valid. Set 24 hours in the future at creation time — see
+    # _send_member_activation() in views.py.
+    expires_at = models.DateTimeField()
+
+    # Flips to True the moment the token is successfully used, so the same
+    # link can't be replayed twice (e.g. by clicking it again, or by
+    # someone who intercepted the email after the fact).
+    is_used = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        # This table is fully managed by Django (created/altered via
+        # migrations), unlike Member above — so no `managed = False` here.
+        db_table = "member_activation_tokens"
+        verbose_name = "Member Activation Token"
+        verbose_name_plural = "Member Activation Tokens"
+
+    def __str__(self):
+        return f"Activation token for {self.member.name} (used={self.is_used})"
+
+    def is_valid(self):
+        """
+        Convenience check used by the activation view: a token is only
+        usable if it hasn't already been consumed AND hasn't expired yet.
+        `timezone.now()` (not plain `datetime.now()`) is important here —
+        Django stores timestamps as timezone-aware, so comparing against a
+        naive datetime would raise a warning/error once USE_TZ is on.
+        """
+        return not self.is_used and self.expires_at > timezone.now()
