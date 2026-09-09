@@ -1,19 +1,27 @@
 """
 emails.py -- MEMBERS module
 
-Handles all outgoing emails for the members app:
+The actual "talk to Resend and send an HTML email" logic for the members
+app. This module does NOT get called directly from views.py anymore —
+it's called from apps/members/tasks.py, which runs on a Celery worker.
+See tasks.py for why (short version: sending email is slow-ish and can
+fail/need retrying, and we don't want an HTTP request that creates a
+member to sit there waiting on a third-party API call).
 
-    1. send_member_welcome_email()  -> sent the moment a member is created.
-       Tells them which library added them and asks them to confirm their
-       email address before their membership becomes active.
+Two emails live here:
 
-    2. send_member_active_email()   -> sent right after the member clicks
-       the confirmation link and their status flips inactive -> active.
+    1. send_member_welcome_email()  -> queued the moment a member is
+       created. Tells them which library added them and asks them to
+       confirm their email address before their membership becomes active.
 
-We use the `resend` Python SDK directly (rather than Django's send_mail()),
-mirroring the exact same pattern already used in apps/users/emails.py, so
-anyone reading both files sees the same shape and doesn't have to learn two
-different ways of sending mail in this codebase.
+    2. send_member_active_email()   -> queued right after the member
+       clicks the confirmation link and their status flips inactive ->
+       active.
+
+We use the `resend` Python SDK directly, mirroring the exact same pattern
+already used in apps/users/emails.py, so anyone reading both files sees
+the same shape and doesn't have to learn two different ways of sending
+mail in this codebase.
 """
 
 import resend
@@ -30,11 +38,19 @@ def send_member_welcome_email(
     library_name: str,
     to_email: str,
     confirmation_url: str,
-) -> bool:
+) -> None:
     """
     Sends the "you've been added as a member" + "please confirm your
-    email" message. Fired once, right after a Member row is created
-    (see MemberCreateView.perform_create in views.py).
+    email" message.
+
+    NOTE ON ERROR HANDLING: this function deliberately does NOT catch
+    exceptions from resend.Emails.send() — it lets them propagate. That's
+    intentional now that this is called from inside a Celery task (see
+    apps/members/tasks.py::send_member_welcome_email_task), which is what
+    actually catches the exception, logs it, and retries the task a few
+    times with a delay. If we swallowed the error here, the task would
+    always look "successful" to Celery even when the email genuinely
+    failed to send, and it would never retry.
 
     Args:
         member_name:       The member's display name — used to personalise
@@ -46,60 +62,39 @@ def send_member_welcome_email(
         confirmation_url:   Full frontend URL containing the member's uid
                              and the raw activation token, e.g.
                              http://localhost:3000/members/confirm?uid=...&token=...
-
-    Returns:
-        True if Resend accepted the email, False if sending failed.
-        We deliberately don't raise here — a failed email shouldn't roll
-        back the member record that was just created; the caller can
-        decide whether/how to surface that (e.g. logging, a resend button).
     """
-    try:
-        resend.Emails.send(
-            {
-                "from": settings.RESEND_FROM_EMAIL,
-                "to": [to_email],
-                "subject": f"You've been added as a member of {library_name}",
-                "html": _build_welcome_email_html(
-                    member_name, library_name, confirmation_url
-                ),
-            }
-        )
-        return True
-    except Exception as e:
-        # In production this should go through a real logger instead of
-        # print(), but print() keeps things simple while you're learning
-        # and still shows up clearly in the console/server logs.
-        print(f"[Email error] Failed to send welcome email to {to_email}: {e}")
-        return False
+    resend.Emails.send(
+        {
+            "from": settings.RESEND_FROM_EMAIL,
+            "to": [to_email],
+            "subject": f"You've been added as a member of {library_name}",
+            "html": _build_welcome_email_html(
+                member_name, library_name, confirmation_url
+            ),
+        }
+    )
 
 
 def send_member_active_email(
     member_name: str,
     library_name: str,
-    membership_no: str,
     to_email: str,
-) -> bool:
+) -> None:
     """
-    Sends the "your account is now active" confirmation. Fired once,
-    right after MemberActivationView successfully verifies the token and
-    flips the member's status to "active" (see views.py).
+    Sends the "your account is now active" confirmation.
 
-    No URL/token needed here — this email is purely informational, it
-    doesn't ask the member to do anything further.
+    Same "let exceptions propagate" reasoning as
+    send_member_welcome_email() above — apps/members/tasks.py is what
+    catches failures here and drives the retry.
     """
-    try:
-        resend.Emails.send(
-            {
-                "from": settings.RESEND_FROM_EMAIL,
-                "to": [to_email],
-                "subject": f"Your {library_name} membership is now active",
-                "html": _build_active_email_html(member_name, library_name, membership_no),
-            }
-        )
-        return True
-    except Exception as e:
-        print(f"[Email error] Failed to send activation-confirmed email to {to_email}: {e}")
-        return False
+    resend.Emails.send(
+        {
+            "from": settings.RESEND_FROM_EMAIL,
+            "to": [to_email],
+            "subject": f"Your {library_name} membership is now active",
+            "html": _build_active_email_html(member_name, library_name),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +195,7 @@ def _build_welcome_email_html(
     """
 
 
-def _build_active_email_html(member_name: str, library_name: str, membership_no: str) -> str:
+def _build_active_email_html(member_name: str, library_name: str) -> str:
     return f"""
     <!DOCTYPE html>
     <html>
@@ -234,7 +229,7 @@ def _build_active_email_html(member_name: str, library_name: str, membership_no:
                   <p style="margin:0 0 24px;font-size:15px;color:#444444;line-height:1.6;">
                     Your email address has been confirmed and your membership
                     at <strong>{library_name}</strong> is now
-                    <strong>active</strong>. Your membership number is {membership_no} You're all set to start borrowing
+                    <strong>active</strong>. You're all set to start borrowing
                     books and using the library's services.
                   </p>
 

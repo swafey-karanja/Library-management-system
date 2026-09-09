@@ -302,6 +302,35 @@ EMAIL_BACKEND = "anymail.backends.resend.EmailBackend"
 ANYMAIL = { "RESEND_API_KEY": os.environ.get("RESEND_API_KEY"), }
 
 CELERY_TIMEZONE = TIME_ZONE  # reuse whatever Django's TIME_ZONE already is
+
+# ---------------------------------------------------------------------------
+# CELERY BROKER / RESULT BACKEND
+# ---------------------------------------------------------------------------
+#
+# BROKER vs RESULT BACKEND, in one sentence each:
+#   - broker_url:        where task MESSAGES go when something calls
+#                         `my_task.delay(...)` — this is the queue itself.
+#                         A worker process, running separately from your
+#                         Django server, watches this queue and pops tasks
+#                         off it to actually run them.
+#   - result_backend:     where the RETURN VALUE / success-or-failure of a
+#                         finished task gets stored, in case some other
+#                         part of the app wants to check on it later. Our
+#                         member email tasks don't return anything
+#                         meaningful, but plenty of Celery setups (this
+#                         one included) still configure it for tasks that do.
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
+
+# JSON only, for both the task's arguments and its return value. This is
+# a security best-practice (Celery's other options, like `pickle`, can
+# execute arbitrary code when deserialized) and also why every task in
+# this project takes plain strings/UUIDs/dicts as arguments rather than
+# whole model instances — a Django model instance isn't JSON-serializable.
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+
 CELERY_BEAT_SCHEDULE = {
     "send-due-soon-reminders": {
         "task": "apps.notifications.tasks.send_due_soon_reminders",

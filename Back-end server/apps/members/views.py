@@ -18,7 +18,7 @@ from rest_framework.views import APIView
 from .models import Member, MemberActivationToken, Status, Gender, MembershipType
 from .serializers import MemberSerializer, MemberActivationSerializer
 from .filters import MemberFilter
-from .emails import send_member_welcome_email, send_member_active_email
+from .tasks import send_member_welcome_email_task, send_member_active_email_task
 from core.permissions import (
     # IsAdminUser,
     IsAdminOrLibrarian,
@@ -94,8 +94,10 @@ class MemberListView(generics.ListAPIView):
 
 def _send_member_activation(member):
     """
-    Creates a MemberActivationToken for the given member and emails them
-    the welcome / "please confirm your email" message.
+    Creates a MemberActivationToken for the given member and QUEUES the
+    welcome / "please confirm your email" email — it does not send it
+    directly. See apps/members/tasks.py for what actually happens after
+    `.delay()` is called below.
 
     Pulled out into its own module-level function (rather than being
     inlined into MemberCreateView) for the same reason apps/users/views.py
@@ -142,12 +144,16 @@ def _send_member_activation(member):
         f"&token={raw_token}"
     )
 
-    send_member_welcome_email(
-        member_name=member.name,
-        library_name=member.library.name,
-        to_email=member.email,
-        confirmation_url=confirmation_url,
-    )
+    # `.delay(...)` — NOT calling send_member_welcome_email_task(...)
+    # directly — is what actually puts this on the Celery broker instead
+    # of running it inline. This function (and the request/response cycle
+    # of whoever called it — MemberCreateView, MemberImportView, or
+    # ResendMemberActivationView) returns immediately; a separate worker
+    # process picks the task up off the queue and sends the real email
+    # whenever it gets to it. Only plain strings are passed (member_id,
+    # confirmation_url) — see the "why IDs, not model instances" note in
+    # tasks.py for why we don't just pass `member` itself.
+    send_member_welcome_email_task.delay(str(member.member_id), confirmation_url)
 
 
 class MemberCreateView(generics.CreateAPIView):
@@ -473,12 +479,10 @@ class MemberActivationView(APIView):
         # Fire the "you're now active" confirmation email. This is a
         # separate, purely informational email from the original welcome
         # one — it doesn't ask the member to do anything further.
-        send_member_active_email(
-            member_name=member.name,
-            library_name=member.library.name,
-            membership_no=member.membership_no,
-            to_email=member.email,
-        )
+        # Same as the welcome email: `.delay()` queues this on the
+        # broker for a worker to send, rather than making the member's
+        # browser wait on Resend's API before this endpoint responds.
+        send_member_active_email_task.delay(str(member.member_id))
 
         return Response(
             {"detail": "Membership confirmed. You are now an active member."},
