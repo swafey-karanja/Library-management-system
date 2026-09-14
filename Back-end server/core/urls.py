@@ -51,5 +51,7 @@ urlpatterns = [
     # Borrow Transactions
     path("api/borrow-transactions/", include("apps.borrow_transactions.urls")),
     # Reservations
-    path("api/reservations/", include("apps.reservations.urls"))
+    path("api/reservations/", include("apps.reservations.urls")),
+    # Inventory
+    path("api/inventory/", include("apps.inventory.urls"))
 ]

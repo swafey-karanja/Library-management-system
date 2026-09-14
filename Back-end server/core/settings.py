@@ -104,7 +104,8 @@ INSTALLED_APPS = [
     "apps.book_copies", #Book copies app
     "apps.borrow_transactions", #Borrow Transactions app
     "apps.notifications", #notifications app
-    "apps.reservations"
+    "apps.reservations", #reservations app
+    "apps.inventory" #inventory app
 ]
 
 # ---------------------------------------------------------------------------
