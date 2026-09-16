@@ -56,6 +56,14 @@ class Library(models.Model):
         editable=False,
     )
 
+    code = models.CharField(
+        max_length=10,
+        unique=True,
+        null=False,
+        blank=False,
+        help_text="Short human-readable branch code, e.g. 'MAIN', 'WEST'.",
+    )
+
     # --- Core fields ---
     # max_length values match the VARCHAR lengths defined in SQL exactly.
     # unique=True mirrors the UNIQUE constraints in the schema.
