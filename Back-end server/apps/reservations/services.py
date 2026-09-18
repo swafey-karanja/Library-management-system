@@ -16,6 +16,7 @@ from django.utils import timezone
 from .models import Reservation
 from django.db import transaction
 from .notifications import notify_reservation_created, notify_reservation_ready
+from apps.book_copies.services import set_copy_status
 
 def library_carries_book(library, book):
     """
@@ -77,8 +78,7 @@ def create_reservation(library, book, member):
                 book_copy=available_copy,
                 expires_at=timezone.now() + timedelta(days=Reservation.HOLD_PERIOD_DAYS),
             )
-            available_copy.status = available_copy.STATUS_RESERVED
-            available_copy.save(update_fields=['status'])
+            set_copy_status(available_copy, available_copy.STATUS_RESERVED)
             notify_reservation_ready(reservation.id)
         else:
             reservation = Reservation.objects.create(
@@ -137,8 +137,7 @@ def assign_or_release_book_copy(book_copy):
     )
 
     if reservation is None:
-        book_copy.status = book_copy.STATUS_AVAILABLE
-        book_copy.save(update_fields=['status'])
+        set_copy_status(book_copy, book_copy.STATUS_AVAILABLE)
         return
 
     reservation.book_copy = book_copy
@@ -146,8 +145,7 @@ def assign_or_release_book_copy(book_copy):
     reservation.expires_at = timezone.now() + timedelta(days=Reservation.HOLD_PERIOD_DAYS)
     reservation.save(update_fields=['book_copy', 'status', 'expires_at'])
 
-    book_copy.status = book_copy.STATUS_RESERVED
-    book_copy.save(update_fields=['status'])
+    set_copy_status(book_copy, book_copy.STATUS_RESERVED)
 
     notify_reservation_ready(reservation.id)
 

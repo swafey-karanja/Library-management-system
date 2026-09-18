@@ -44,6 +44,8 @@ from .serializers import (
 )
 from .notifications import notify_checkout, notify_return, notify_update, NOTIFIABLE_FIELDS
 from apps.reservations.services import assign_or_release_book_copy, close_matching_reservation
+from apps.inventory.services import sync_inventory_many
+from apps.book_copies.services import set_copy_status
 
 # ORM path from BorrowTransaction down to a library id. This model has
 # no direct `library` FK (see models.py) — it's scoped through the
@@ -63,6 +65,9 @@ def _sync_book_copy_status(borrow_transaction):
 
     if borrow_transaction.status == BorrowTransaction.STATUS_RETURNED:
         if book_copy.status != book_copy.STATUS_AVAILABLE:
+            # assign_or_release_book_copy() already syncs inventory
+            # itself (see apps/reservations/services.py) — no need to
+            # duplicate that call here.
             assign_or_release_book_copy(book_copy)
         return
 
@@ -73,8 +78,11 @@ def _sync_book_copy_status(borrow_transaction):
     }
     new_copy_status = status_map.get(borrow_transaction.status)
     if new_copy_status and book_copy.status != new_copy_status:
-        book_copy.status = new_copy_status
-        book_copy.save(update_fields=['status'])
+        # Single-transaction correction (used by BorrowTransactionUpdateView
+        # and, per-item, by BorrowTransactionBulkUpdateView) — items here
+        # don't reliably share the same book, so the helper's immediate
+        # sync (its default) suits this better than batching.
+        set_copy_status(book_copy, new_copy_status)
 
 
 # Fallback cap on active (not yet returned) loans a member may hold at
@@ -374,8 +382,7 @@ class BorrowCheckoutView(APIView):
             )
             borrow_transaction.save()
 
-            book_copy.status = book_copy.STATUS_BORROWED
-            book_copy.save(update_fields=['status'])
+            set_copy_status(book_copy, book_copy.STATUS_BORROWED)
 
             close_matching_reservation(member, book_copy)  # NEW
 
@@ -486,12 +493,20 @@ class BorrowBatchCheckoutView(APIView):
                 )
                 borrow_transaction.save()
 
-                copy.status = copy.STATUS_BORROWED
-                copy.save(update_fields=['status'])
+                set_copy_status(copy, copy.STATUS_BORROWED, sync=False)
 
                 close_matching_reservation(member, copy)
 
                 created_transactions.append(borrow_transaction)
+
+            # INVENTORY SYNC: once per DISTINCT (library, book) pair in
+            # this batch — a stack of copies scanned at the desk is
+            # often several DIFFERENT titles, but any repeats still
+            # collapse to one sync call each.
+            touched_pairs = {
+                (copy.library_id, copy.book_id) for copy in locked_copies
+            }
+            sync_inventory_many(touched_pairs)
 
         notify_checkout([txn.id for txn in created_transactions])
 
@@ -545,11 +560,11 @@ class BorrowReturnView(APIView):
                 book_copy.save(update_fields=['condition'])
 
             if condition == book_copy.CONDITION_DAMAGED:
-                book_copy.status = book_copy.STATUS_DAMAGED
-                book_copy.save(update_fields=['status'])
+                set_copy_status(book_copy, book_copy.STATUS_DAMAGED)
             else:
                 # Never call assign_or_release_book_copy for a damaged
                 # copy — only reaches here when it's genuinely returnable.
+                # It syncs inventory itself (see reservations/services.py).
                 assign_or_release_book_copy(book_copy)
             book_copy.save(update_fields=['status', 'condition'])
 
@@ -640,9 +655,9 @@ class BorrowBatchReturnView(APIView):
                     book_copy.save(update_fields=['condition'])
 
                 if condition == book_copy.CONDITION_DAMAGED:
-                    book_copy.status = book_copy.STATUS_DAMAGED
-                    book_copy.save(update_fields=['status'])
+                    set_copy_status(book_copy, book_copy.STATUS_DAMAGED)
                 else:
+                    # Syncs inventory itself (see reservations/services.py).
                     assign_or_release_book_copy(book_copy)
                 book_copy.save(update_fields=['status', 'condition'])
 
