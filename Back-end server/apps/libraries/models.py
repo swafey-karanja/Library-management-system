@@ -56,7 +56,7 @@ class Library(models.Model):
         editable=False,
     )
 
-    code = models.CharField(
+    library_code = models.CharField(
         max_length=10,
         unique=True,
         null=False,

@@ -133,3 +133,47 @@ class BookCopyCreateSpecSerializer(serializers.Serializer):
                 'each generated copy needs its own auto-generated barcode.'
             )
         return attrs
+
+class BookCopyImportRowSerializer(serializers.Serializer):
+    """
+    Validates the VALUES of ONE row from an imported CSV — and nothing
+    else. It never touches the database.
+
+    WHY A SERIALIZER, AND WHY THESE FIELD TYPES?
+    --------------------------------------------
+    The import view used to copy cell text straight onto model fields.
+    A cell like status="garbage" then reached Postgres, which rejected
+    the whole batch with a 500 and threw away every valid row too.
+    Running each row through this serializer first turns that into a
+    normal per-row error ("status: not a valid choice") while the good
+    rows still get imported.
+
+    The important detail is `library` and `book` being UUIDField, NOT
+    PrimaryKeyRelatedField. A PrimaryKeyRelatedField runs one SELECT
+    per row to check the object exists — exactly the per-row query
+    cost the batched import was designed to avoid. UUIDField only
+    checks "is this a well-formed UUID?" (pure Python). The view then
+    verifies that all the libraries and books exist with ONE query
+    each, after every row has been validated.
+
+    Blank CSV cells never reach this serializer: the view drops empty
+    values first, because for optional columns "blank" means "leave
+    unchanged", not "set to empty".
+    """
+
+    library = serializers.UUIDField()
+    book = serializers.UUIDField()
+    barcode = serializers.CharField(max_length=100)
+
+    # Same choices as the model, so the allowed values can never drift
+    # apart from BookCopy.STATUS_CHOICES / CONDITION_CHOICES.
+    status = serializers.ChoiceField(choices=BookCopy.STATUS_CHOICES, required=False)
+    condition = serializers.ChoiceField(choices=BookCopy.CONDITION_CHOICES, required=False)
+
+    # max_length mirrors the VARCHAR(100) column, so an over-long value
+    # is reported for that row instead of raising a DataError later.
+    shelf_location = serializers.CharField(max_length=100, required=False)
+
+    # Parses ISO-8601 text such as "2026-09-01T10:30:00Z" into a real,
+    # timezone-aware datetime, or reports a clear error for that row.
+    acquired_at = serializers.DateTimeField(required=False)

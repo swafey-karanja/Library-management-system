@@ -26,6 +26,62 @@ import uuid
 from django.db import models
 
 
+class PostgresEnumField(models.CharField):
+    """
+    A CharField that tells Django its real database type is a native
+    Postgres ENUM (e.g. `book_status`), not VARCHAR.
+
+    WHY THIS EXISTS
+    ---------------
+    Django asks every field "what is your SQL type?" via `db_type()`.
+    For bulk operations (bulk_create / bulk_update) Django wraps the
+    values in a SQL CAST to that type, so Postgres knows what it is
+    receiving. A plain CharField answers "varchar(30)", and Postgres
+    refuses to assign a varchar to an ENUM column:
+
+        column "status" is of type book_status but expression is of
+        type character varying
+
+    A single `.save()` never hit this because it sends a bare quoted
+    literal ('available'), which Postgres coerces to the enum on its
+    own. Only the CAST that bulk operations add exposes the mismatch.
+
+    By answering with the enum's name, the cast becomes
+    `::book_status` and Postgres accepts it.
+
+    Everything else (choices, validation, serializers, filters,
+    admin) behaves exactly like a normal CharField, because this class
+    only overrides how the column type is *reported*.
+
+    Because the model is `managed = False`, Django never uses
+    `db_type()` to CREATE the column (you did that in SQL) — it is only
+    used for the casts described above.
+    """
+
+    def __init__(self, *args, enum_type, **kwargs):
+        # `enum_type` is keyword-only and required: the name of the
+        # Postgres type, exactly as in your CREATE TYPE statement.
+        self.enum_type = enum_type
+        super().__init__(*args, **kwargs)
+
+    def db_type(self, connection):
+        # Only Postgres has native enums. On any other database (e.g.
+        # a SQLite test run) fall back to normal CharField behaviour
+        # so this field never breaks a non-Postgres setup.
+        if connection.vendor == "postgresql":
+            return self.enum_type
+        return super().db_type(connection)
+
+    def deconstruct(self):
+        # deconstruct() lets Django rebuild a field from its saved
+        # description (used by the migration system). Any custom
+        # __init__ argument must be included, or Django would try to
+        # recreate the field without `enum_type` and crash.
+        name, path, args, kwargs = super().deconstruct()
+        kwargs["enum_type"] = self.enum_type
+        return name, path, args, kwargs
+
+
 class BookCopy(models.Model):
     """
     Represents a single physical copy of a Book.
@@ -159,13 +215,15 @@ class BookCopy(models.Model):
 
     # max_length here refers to the longest possible *choice string*,
     # not a SQL column width — Postgres is enforcing the real type.
-    status = models.CharField(
+    status = PostgresEnumField(
+        enum_type='book_status',   # must match CREATE TYPE book_status
         max_length=30,
         choices=STATUS_CHOICES,
         default=STATUS_AVAILABLE,
     )
 
-    condition = models.CharField(
+    condition = PostgresEnumField(
+        enum_type='book_condition',   # must match CREATE TYPE book_condition
         max_length=50,
         choices=CONDITION_CHOICES,
         default=CONDITION_NEW,
@@ -228,56 +286,24 @@ class BookCopy(models.Model):
         # single physical copy, so we use that instead of the raw UUID.
         return f'Copy {self.barcode} ({self.status})'
 
-        # ------------------------------------------------------------------
-        # AUTO-GENERATED BARCODE
-        # ------------------------------------------------------------------
     def save(self, *args, **kwargs):
         """
-        If no barcode was given, generate one from the book's ISBN-13
-        plus a sequence number (e.g. "9780134685991-0001"). An explicit
-        barcode is always left as-is.
+        Runs on every single-object save (`copy.save()`, or a DRF
+        serializer's `.save()`).
 
-        Cost note: `self.book` is usually already cached from FK
-        validation in the serializer, so reading `self.book.isbn_13`
-        rarely triggers an extra query. The one genuine extra query is
-        the COUNT below (indexed on book_id, so cheap).
+        Its only job now is to default `acquired_at` to "now".
+
+        Barcode generation used to live here, but it was moved OUT of
+        the model on purpose: building a barcode needs a database
+        COUNT, and doing that inside save() meant one extra query per
+        copy. Barcodes are now built in bulk by the create view using
+        the pure helpers in `barcode.py`.
+
+        IMPORTANT: `bulk_create()` and `bulk_update()` do NOT call
+        save(). Any code that uses them must set `acquired_at` itself.
         """
-        # if not self.barcode:
-        #     self.barcode = self._generate_barcode()
-
-        # Auto-populate acquired_at if not provided
         if self.acquired_at is None:
             from django.utils import timezone
             self.acquired_at = timezone.now()
 
         super().save(*args, **kwargs)
-
-    # def _generate_barcode(self):
-    #     """Builds "<prefix>-<sequence>", guaranteed unique."""
-    #     if not self.book_id:
-    #         raise ValueError('Cannot auto-generate a barcode without a related book.')
-    #
-    #     prefix = self._barcode_prefix()
-    #
-    #     # Sequence starts after however many copies of this book already exist.
-    #     existing_copies_of_this_book = BookCopy.objects.filter(book_id=self.book_id).count()
-    #     sequence_number = existing_copies_of_this_book + 1
-    #     candidate_barcode = f'{prefix}-{str(sequence_number).zfill(4)}'
-    #
-    #     # Rare-collision guard (e.g. gaps from deletions) — should basically never loop.
-    #     while BookCopy.objects.filter(barcode=candidate_barcode).exists():
-    #         sequence_number += 1
-    #         candidate_barcode = f'{prefix}-{str(sequence_number).zfill(4)}'
-    #
-    #     return candidate_barcode
-    #
-    # def _barcode_prefix(self):
-    #     """ISBN-13 preferred, then ISBN-10, then a title slug. getattr()
-    #     keeps this safe if the books app's field names end up different."""
-    #     isbn = getattr(self.book, 'isbn_13', None) or getattr(self.book, 'isbn_10', None)
-    #     if isbn:
-    #         return str(isbn)
-    #
-    #     title = getattr(self.book, 'title', '') or 'BOOK'
-    #     slug = ''.join(character for character in title.upper() if character.isalnum())[:8]
-    #     return slug or 'BOOK'

@@ -17,5 +17,16 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+      image: redis:7
+      container_name: redis_library_broker
+      restart: unless-stopped
+      ports:
+        - "6379:6379"
+      volumes:
+        - redis_data:/data
+      command: redis-server --appendonly yes
+
 volumes:
   postgres_data:
+  redis_data:

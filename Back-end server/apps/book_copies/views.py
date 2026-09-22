@@ -34,7 +34,7 @@ import csv
 import io
 import uuid
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from datetime import timedelta
 from django.db.models import Count, Q
 from django.http.response import StreamingHttpResponse
@@ -51,7 +51,8 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.parsers import MultiPartParser
 from apps.libraries.models import Library
 from apps.books.models import Book
-from .barcode import build_barcode
+from .barcode import build_prefix, format_barcode, highest_sequence
+from .bulk import bulk_update_grouped_by_fields
 
 from core.permissions import (
     LibraryScopedQuerysetMixin,
@@ -63,7 +64,8 @@ from .models import BookCopy
 from .serializers import (
     BookCopySerializer,
     BookCopyBulkUpdateItemSerializer,
-    BookCopyCreateSpecSerializer
+    BookCopyCreateSpecSerializer,
+    BookCopyImportRowSerializer,
 )
 from .filters import BookCopyFilter
 
@@ -159,6 +161,33 @@ class BookCopyDetailView(LibraryScopedQuerysetMixin, generics.RetrieveAPIView):
 
 class BookCopyCreateView(APIView):
     permission_classes = [IsAdminOrLibrarian]
+    """
+    POST /api/book-copies/add/
+
+    Body: one spec object, or an array of specs:
+        {"library": "<uuid>", "book": "<uuid>", "quantity": 5}
+        {"library": "<uuid>", "book": "<uuid>", "barcode": "MY-CUSTOM-1"}
+
+    HOW BARCODES ARE CHOSEN
+    -----------------------
+    * A spec with an explicit `barcode` (only allowed when quantity is
+      1) uses exactly that barcode.
+    * Otherwise barcodes are generated as
+      '<ISBN-or-slug>-<LIBRARY_CODE>-<NNNN>', continuing from the
+      HIGHEST sequence already used for that prefix (see barcode.py
+      for why "highest + 1" and not "count + 1").
+
+    HOW IT STAYS SAFE UNDER CONCURRENCY
+    -----------------------------------
+    Two requests creating copies for the same library at the same
+    moment could both read "highest = 5" and both try to insert
+    "-0006". To prevent that, every Library row involved is LOCKED
+    inside a transaction, so the second request waits until the first
+    has committed and then sees the updated numbers.
+
+    The lock is on the Library row (owned by ONE tenant), never on the
+    shared Book row, so different libraries never wait on each other.
+    """
 
     def post(self, request, *args, **kwargs):
         is_batch_request = isinstance(request.data, list)
@@ -174,7 +203,8 @@ class BookCopyCreateView(APIView):
         spec_serializer.is_valid(raise_exception=True)
         specs = spec_serializer.validated_data
 
-        # ---- Library scoping (unchanged from original) ----
+        # ---- Library scoping (pattern C): a librarian may only create
+        # copies for their own library. Admins (None) may use any. ----
         requesting_user_library_id = get_user_library_id(request.user)
         if requesting_user_library_id is not None:
             mismatched_specs = [
@@ -199,90 +229,140 @@ class BookCopyCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ---- Collect the distinct libraries involved in this request. ----
-        # Every spec must belong to exactly one library per request in
-        # practice, but we handle the general case: if a batch spans
-        # multiple libraries, we lock and process each separately.
-        libraries_in_request = {spec['library'].pk: spec['library'] for spec in specs}
+        # ---- Explicit barcodes: check them up front. ----
+        # An empty string means "no barcode given" (auto-generate).
+        explicit_barcodes = [spec['barcode'] for spec in specs if spec.get('barcode')]
 
-        created_copies = []
-        with transaction.atomic():
-            # Lock every involved Library row, in a deterministic order
-            # (sorted by pk) to avoid deadlocks if two requests ever
-            # overlap. This is the ONLY lock in the whole operation.
-            #
-            # It is scoped to Library, NOT Book — so two different
-            # libraries adding copies of the same book never block
-            # each other. Cross-tenant blocking is structurally
-            # impossible here.
-            locked_libraries = {}
-            for library_pk in sorted(libraries_in_request.keys()):
-                locked_libraries[library_pk] = (
-                    Library.objects.select_for_update().get(pk=library_pk)
+        if len(explicit_barcodes) != len(set(explicit_barcodes)):
+            return Response(
+                {'detail': 'The same barcode appears more than once in the request.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if explicit_barcodes:
+            # ONE query for all of them. Deliberately NOT library-scoped:
+            # barcodes are unique across the whole system, so a barcode
+            # used by ANY library is unavailable.
+            already_used = sorted(
+                BookCopy.objects
+                .filter(barcode__in=explicit_barcodes)
+                .values_list('barcode', flat=True)
+            )
+            if already_used:
+                return Response(
+                    {
+                        'detail': 'One or more barcodes are already in use.',
+                        'barcodes': already_used,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # ---- Process each library's specs separately. ----
-            # Group specs by library so we can do one COUNT per
-            # (book, library) pair, not one per spec.
-            for library_pk, library in locked_libraries.items():
-                library_specs = [
-                    spec for spec in specs if spec['library'].pk == library_pk
-                ]
+        library_pks = sorted({spec['library'].pk for spec in specs})
 
-                # Group by book so repeated specs for the same book
-                # share a single COUNT and continue the sequence.
-                specs_by_book = {}
-                for spec in library_specs:
-                    specs_by_book.setdefault(spec['book'].pk, []).append(spec)
+        try:
+            with transaction.atomic():
+                # Lock every involved Library row in a fixed order
+                # (sorted by pk) so two overlapping requests can never
+                # deadlock by grabbing the same rows in opposite orders.
+                #
+                # no_key=True -> "FOR NO KEY UPDATE" instead of "FOR
+                # UPDATE". Two creators for the SAME library still wait
+                # for each other, but unrelated inserts that merely
+                # reference this library (a new member, an inventory
+                # row, ...) are NOT blocked. Plain FOR UPDATE blocks
+                # those too, because Postgres foreign-key checks take a
+                # weak lock on the parent row.
+                #
+                # Use the freshly locked rows (not the copies read
+                # during validation) so `code` is current.
+                locked_libraries = {
+                    library.pk: library
+                    for library in (
+                        Library.objects
+                        .select_for_update(no_key=True)
+                        .filter(pk__in=library_pks)
+                        .order_by('pk')
+                    )
+                }
 
-                for book_pk, book_specs in specs_by_book.items():
-                    book = book_specs[0]['book']
+                # Next free sequence number per prefix. Keyed by PREFIX
+                # (not by book) so two different books that happen to
+                # share a prefix draw from ONE counter.
+                next_sequence_by_prefix = {}
+                new_copies = []
 
-                    # ONE count per (book, library) — the sequence
-                    # starting point for every copy of this book in
-                    # this library.
-                    existing_count = BookCopy.objects.filter(
-                        book_id=book_pk,
-                        library_id=library_pk,
-                    ).count()
-                    next_sequence = existing_count + 1
+                for spec in specs:
+                    library = locked_libraries[spec['library'].pk]
+                    book = spec['book']
 
-                    for spec in book_specs:
-                        quantity = spec['quantity']
+                    # Fields the caller may set; anything omitted falls
+                    # back to the model default (available / new).
+                    shared_fields = {
+                        field: spec[field]
+                        for field in ('status', 'condition', 'shelf_location')
+                        if field in spec
+                    }
+                    # bulk_create skips save(), so acquired_at must be
+                    # set explicitly here.
+                    acquired_at = spec.get('acquired_at') or timezone.now()
 
-                        shared_fields = {}
-                        for field in ('status', 'condition', 'shelf_location'):
-                            if field in spec:
-                                shared_fields[field] = spec[field]
+                    # -- Explicit barcode: use it as-is, consume no number.
+                    if spec.get('barcode'):
+                        new_copies.append(BookCopy(
+                            library=library, book=book,
+                            barcode=spec['barcode'],
+                            acquired_at=acquired_at, **shared_fields,
+                        ))
+                        continue
 
-                        # acquired_at: set explicitly because
-                        # bulk_create doesn't call save().
-                        acquired_at = spec.get('acquired_at') or timezone.now()
+                    # -- Auto-generated barcodes.
+                    prefix = build_prefix(
+                        isbn=book.isbn_13 or book.isbn_10,
+                        title=book.title,
+                        library_code=library.code,
+                    )
 
-                        for _ in range(quantity):
-                            barcode = build_barcode(
-                                isbn=getattr(book, 'isbn_13', None)
-                                     or getattr(book, 'isbn_10', None),
-                                title=getattr(book, 'title', ''),
-                                library_code=library.code,
-                                sequence=next_sequence,
-                            )
-                            next_sequence += 1
+                    if prefix not in next_sequence_by_prefix:
+                        # One query the FIRST time we see this prefix.
+                        # Filtering by library_id uses an existing index
+                        # and keeps the scan inside one tenant's rows.
+                        existing_barcodes = (
+                            BookCopy.objects
+                            .filter(library_id=library.pk, barcode__startswith=f'{prefix}-')
+                            .values_list('barcode', flat=True)
+                        )
+                        next_sequence_by_prefix[prefix] = (
+                            highest_sequence(existing_barcodes, prefix) + 1
+                        )
 
-                            created_copies.append(BookCopy(
-                                library=library,
-                                book=book,
-                                barcode=barcode,
-                                acquired_at=acquired_at,
-                                **shared_fields,
-                            ))
+                    for _ in range(spec['quantity']):
+                        sequence = next_sequence_by_prefix[prefix]
+                        next_sequence_by_prefix[prefix] = sequence + 1
+                        new_copies.append(BookCopy(
+                            library=library, book=book,
+                            barcode=format_barcode(prefix, sequence),
+                            acquired_at=acquired_at, **shared_fields,
+                        ))
 
-            # ---- One batched INSERT (Django chunks at ~100 rows). ----
-            BookCopy.objects.bulk_create(created_copies)
+                # ONE INSERT for every copy in the request.
+                BookCopy.objects.bulk_create(new_copies)
 
-        response_serializer = BookCopySerializer(created_copies, many=True)
+        except IntegrityError:
+            # Backstop: the checks above make a barcode clash very
+            # unlikely, but if something else slipped a conflicting
+            # barcode in (e.g. a direct SQL insert), answer with a
+            # clean error instead of a 500. The transaction has already
+            # rolled back, so nothing was saved.
+            return Response(
+                {'detail': 'A barcode conflict occurred. Nothing was created; please retry.'},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-        if not is_batch_request and len(created_copies) == 1:
+        # `new_copies` already hold their library and book objects, so
+        # serializing them triggers no extra queries.
+        response_serializer = BookCopySerializer(new_copies, many=True)
+
+        if not is_batch_request and len(new_copies) == 1:
             return Response(response_serializer.data[0], status=status.HTTP_201_CREATED)
 
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
@@ -328,10 +408,24 @@ class BookCopyBulkUpdateView(APIView):
 
     EFFICIENCY: the actual UPDATE is done with bulk_update() instead of
     a per-row save() loop, collapsing up to N individual UPDATE
-    statements into ~ceil(N / batch_size) batched statements. Because
-    bulk_update() writes *every* field listed for *every* row, each
-    row's untouched fields are first backfilled with their current
-    values so nothing gets accidentally overwritten.
+    statements into a small, fixed number of batched statements.
+
+    AVOIDING LOST UPDATES: bulk_update() writes *every* field listed
+    in `fields=` for *every* row it's given — not just the fields that
+    changed. An earlier version of this view worked around that by
+    backfilling each row's untouched fields with their *current*
+    value before calling bulk_update(). That has a race condition: if
+    another request changes one of those "untouched" fields between
+    this view reading the row and its bulk_update() call firing (e.g.
+    a member checks the copy out, flipping `status`), that change is
+    silently overwritten — even though this request never touched
+    `status`.
+
+    Instead, rows are grouped by exactly WHICH fields they changed
+    (see bulk.py), and one bulk_update() call is issued per group,
+    naming only that group's fields. A field this request never
+    touched can then never appear in ANY bulk_update() call, so it can
+    never be overwritten — regardless of what changes concurrently.
 
     NOTE: bulk_update() does NOT call Model.save() and does NOT fire
     pre_save / post_save signals. If anything downstream listens for
@@ -386,29 +480,26 @@ class BookCopyBulkUpdateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ---- 5. Apply changes in memory, then flush with bulk_update. ----
+        # ---- 5. Apply only the CHANGED fields in memory, then flush. ----
         # atomic() = all-or-nothing if something goes wrong mid-batch.
         #
-        # Why the "fill in the blanks" loop:
-        #   bulk_update() writes *every* field in `fields` for *every*
-        #   row it's given. To preserve the old per-row behaviour of
-        #   "only update the columns the caller actually sent", each
-        #   row's untouched fields are first set to their *current*
-        #   values, so writing them back is a no-op.
+        # Each row's untouched fields are left completely alone — not
+        # read, not reassigned. `touched_fields` records exactly which
+        # attributes this row is changing, so bulk_update_grouped_by_
+        # fields() can group rows by that signature and never write a
+        # field this request didn't ask to change (see bulk.py).
+        rows_to_write = []
         with transaction.atomic():
             for item in items:
                 copy = copies_by_id[item['id']]
+                touched_fields = set(BULK_UPDATABLE_FIELDS) & item.keys()
 
-                for field_name in BULK_UPDATABLE_FIELDS:
-                    if field_name in item:
-                        setattr(copy, field_name, item[field_name])
-                    # else: leave as-is — it already holds the current
-                    # value, and bulk_update will write it back unchanged.
+                for field_name in touched_fields:
+                    setattr(copy, field_name, item[field_name])
 
-            BookCopy.objects.bulk_update(
-                copies_by_id.values(),
-                fields=BULK_UPDATABLE_FIELDS,
-            )
+                rows_to_write.append((copy, touched_fields))
+
+            bulk_update_grouped_by_fields(BookCopy, rows_to_write)
 
         # ---- 6. Serialize the in-memory objects we just updated. ----
         response_serializer = BookCopySerializer(
@@ -606,7 +697,15 @@ class BookCopyImportView(APIView):
     status, condition, shelf_location, acquired_at.
 
     Upsert by barcode: existing row -> update, unmatched -> create.
-    Best-effort: invalid rows are reported but don't block valid ones.
+    Best-effort: a bad row is reported in `errors` and skipped; it does
+    NOT stop the good rows from being saved.
+
+    THE FIVE PHASES (everything is batched — no per-row queries)
+      1. Parse + validate every row in Python (no database).
+      2. One lookup for the barcodes that already exist.
+      3. One lookup each for the libraries and books mentioned.
+      4. Sort the valid rows into "create" and "update" lists.
+      5. Write everything in ONE transaction.
 
     LIBRARY SCOPING (patterns B + C together):
       B) the "does this barcode already exist" lookup is scoped, so a
@@ -614,22 +713,33 @@ class BookCopyImportView(APIView):
       C) on CREATE, the row's own `library` column is validated
          against the requester's library.
 
-    EFFICIENCY: unlike a per-row upsert (which issues ~3-5 SQL queries
-    per row), this version resolves everything in a handful of batched
-    queries and writes with bulk_create / bulk_update. A 1000-row CSV
-    goes from ~4000-5000 round trips to ~10-20.
+    A row is reported as an error (instead of crashing the request) if:
+      - a value is invalid (unknown status, bad date, too long, ...)
+      - the same barcode appears earlier in the same CSV
+      - the library or book doesn't exist
+      - a librarian names a library other than their own
+      - a NEW barcode is already used by a copy the librarian can't see
+        (barcodes are unique across ALL libraries)
 
-    RACE CONDITION: the whole import runs inside a single transaction
-    with the involved Library rows locked via select_for_update(), in
-    sorted-pk order. This serializes concurrent imports of the same
-    library without ever blocking a different library — cross-tenant
-    blocking is structurally impossible because locks are per-Library.
+    If a concurrent request changes the data between our checks and our
+    write (rare), the whole import is rolled back and answered with
+    409 so the caller can safely retry.
     """
 
     parser_classes = [MultiPartParser]
 
+    REQUIRED_COLUMNS = ('library', 'book', 'barcode')
     # Columns applied on create/update if present and non-empty.
     OPTIONAL_COLUMNS = ('status', 'condition', 'shelf_location', 'acquired_at')
+
+    @staticmethod
+    def _flatten_errors(serializer_errors):
+        """DRF reports {'status': [ErrorDetail(...), ...]}. Flatten each
+        list to a single readable string: {'status': '...'}."""
+        return {
+            field: ' '.join(str(message) for message in messages)
+            for field, messages in serializer_errors.items()
+        }
 
     def post(self, request, *args, **kwargs):
         uploaded_file = request.FILES.get('file')
@@ -667,17 +777,13 @@ class BookCopyImportView(APIView):
 
         reader = csv.DictReader(io.StringIO(decoded_content))
 
-        required_columns = {'library', 'book', 'barcode'}
-        provided_columns = set(reader.fieldnames or [])
-        missing_columns = required_columns - provided_columns
+        missing_columns = set(self.REQUIRED_COLUMNS) - set(reader.fieldnames or [])
         if missing_columns:
             return Response(
                 {'detail': f'CSV is missing required column(s): {sorted(missing_columns)}'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Read all rows up front so we can batch every lookup. Row numbers
-        # start at 2 (row 1 is the header) to match a spreadsheet view.
         raw_rows = list(reader)
         if len(raw_rows) > MAX_IMPORT_ROWS:
             return Response(
@@ -694,48 +800,57 @@ class BookCopyImportView(APIView):
         errors = []
 
         # ------------------------------------------------------------------
-        # PHASE 1: Parse and pre-validate every row. No DB access yet.
+        # PHASE 1: Validate every row in Python. No database access yet.
         # ------------------------------------------------------------------
-        # Each parsed row keeps its original line number so errors map
-        # back to what the user sees in their spreadsheet.
+        # Row numbers start at 2 (row 1 is the header) so error messages
+        # match the line numbers the user sees in their spreadsheet.
         parsed_rows = []
+        seen_barcodes = set()
+
         for row_number, row in enumerate(raw_rows, start=2):
-            barcode = (row.get('barcode') or '').strip()
-            if not barcode:
+            # Keep only NON-EMPTY cells. For optional columns a blank
+            # cell means "leave unchanged", so it must not be validated
+            # or written.
+            cleaned = {}
+            for column in self.REQUIRED_COLUMNS + self.OPTIONAL_COLUMNS:
+                value = (row.get(column) or '').strip()
+                if value:
+                    cleaned[column] = value
+
+            row_serializer = BookCopyImportRowSerializer(data=cleaned)
+            if not row_serializer.is_valid():
                 errors.append({
                     'row': row_number,
-                    'errors': {'barcode': 'This field is required.'},
+                    'barcode': cleaned.get('barcode'),
+                    'errors': self._flatten_errors(row_serializer.errors),
                 })
                 continue
 
-            row_data = {
-                'library': (row.get('library') or '').strip(),
-                'book': (row.get('book') or '').strip(),
-                'barcode': barcode,
-            }
+            # validated_data holds REAL Python types now (UUID objects,
+            # timezone-aware datetimes), not raw strings.
+            data = row_serializer.validated_data
+            barcode = data['barcode']
 
-            for column in self.OPTIONAL_COLUMNS:
-                value = (row.get(column) or '').strip()
-                if value:
-                    row_data[column] = value
-
-            if not row_data['library'] or not row_data['book']:
+            # The same barcode twice in one file would make the second
+            # INSERT violate the unique constraint and sink the whole
+            # batch, so catch it here for creates AND updates alike.
+            if barcode in seen_barcodes:
                 errors.append({
                     'row': row_number,
                     'barcode': barcode,
-                    'errors': {
-                        'library': 'This field is required.' if not row_data['library'] else None,
-                        'book': 'This field is required.' if not row_data['book'] else None,
-                    },
+                    'errors': {'barcode': 'Duplicate barcode in CSV.'},
                 })
                 continue
+            seen_barcodes.add(barcode)
 
-            parsed_rows.append({'row_number': row_number, 'data': row_data})
+            parsed_rows.append({'row_number': row_number, 'data': data})
 
         # ------------------------------------------------------------------
-        # PHASE 2: ONE scoped lookup for all existing barcodes.
+        # PHASE 2: Which barcodes already exist?
         # ------------------------------------------------------------------
-        all_barcodes = [p['data']['barcode'] for p in parsed_rows]
+        all_barcodes = [parsed['data']['barcode'] for parsed in parsed_rows]
+
+        # (a) Copies this user is ALLOWED to see/edit -> update candidates.
         existing_by_barcode = {
             copy.barcode: copy
             for copy in scope_queryset_to_library(
@@ -743,55 +858,67 @@ class BookCopyImportView(APIView):
             )
         }
 
+        # (b) Barcodes that exist but BELONG TO ANOTHER LIBRARY. A
+        # librarian can't update those, and can't create them either
+        # (barcodes are unique system-wide). Without this check the
+        # INSERT would violate the unique constraint and fail the whole
+        # import. Only barcodes not already found in (a) need checking,
+        # and admins can see everything so they skip this entirely.
+        # This query is deliberately NOT scoped; we only read barcode
+        # strings from it, never the other library's data.
+        taken_by_another_library = set()
+        if requesting_user_library_id is not None:
+            unseen_barcodes = [b for b in all_barcodes if b not in existing_by_barcode]
+            if unseen_barcodes:
+                taken_by_another_library = set(
+                    BookCopy.objects
+                    .filter(barcode__in=unseen_barcodes)
+                    .values_list('barcode', flat=True)
+                )
+
         # ------------------------------------------------------------------
         # PHASE 3: ONE lookup each for libraries and books.
         # ------------------------------------------------------------------
-        # These are looked up by their identifier column (pk, or whatever
-        # the CSV supplies). Adjust the field names to match your schema —
-        # if the CSV uses UUIDs for library/book, this is `pk__in`; if it
-        # uses codes, use the code field instead.
-        library_ids = {p['data']['library'] for p in parsed_rows}
-        book_ids = {p['data']['book'] for p in parsed_rows}
-
+        # The serializer already turned these cells into UUID objects, so
+        # they match the model's primary keys directly (this also removes
+        # a subtle bug where an UPPERCASE uuid string would never have
+        # matched the lowercase str(pk) used as a dictionary key before).
         libraries_by_id = {
-            str(lib.pk): lib
-            for lib in Library.objects.filter(pk__in=library_ids)
+            library.pk: library
+            for library in Library.objects.filter(
+                pk__in={parsed['data']['library'] for parsed in parsed_rows}
+            )
         }
         books_by_id = {
-            str(book.pk): book
-            for book in Book.objects.filter(pk__in=book_ids)
+            book.pk: book
+            for book in Book.objects.filter(
+                pk__in={parsed['data']['book'] for parsed in parsed_rows}
+            )
         }
 
         # ------------------------------------------------------------------
-        # PHASE 4: Classify rows into creates vs updates in memory.
+        # PHASE 4: Sort valid rows into creates and updates (in memory).
         # ------------------------------------------------------------------
         to_create = []
         to_update = []
-        # Track which existing rows we've already touched, so a CSV that
-        # repeats a barcode twice doesn't append two updates to the same
-        # instance (the last write would win anyway, but deduping avoids
-        # confusing bookkeeping).
-        seen_update_barcodes = set()
 
         for parsed in parsed_rows:
             row_number = parsed['row_number']
-            row_data = parsed['data']
-            barcode = row_data['barcode']
+            data = parsed['data']
+            barcode = data['barcode']
 
-            library = libraries_by_id.get(row_data['library'])
+            library = libraries_by_id.get(data['library'])
             if library is None:
                 errors.append({
-                    'row': row_number,
-                    'barcode': barcode,
+                    'row': row_number, 'barcode': barcode,
                     'errors': {'library': 'Library not found.'},
                 })
                 continue
 
-            book = books_by_id.get(row_data['book'])
+            book = books_by_id.get(data['book'])
             if book is None:
                 errors.append({
-                    'row': row_number,
-                    'barcode': barcode,
+                    'row': row_number, 'barcode': barcode,
                     'errors': {'book': 'Book not found.'},
                 })
                 continue
@@ -799,83 +926,103 @@ class BookCopyImportView(APIView):
             existing_copy = existing_by_barcode.get(barcode)
 
             if existing_copy:
-                # LIBRARY SCOPING (pattern B): the scoped lookup above
-                # already guarantees this copy belongs to the requester's
-                # library (or that the requester is an admin).
-                if barcode in seen_update_barcodes:
-                    errors.append({
-                        'row': row_number,
-                        'barcode': barcode,
-                        'errors': {'barcode': 'Duplicate barcode in CSV.'},
-                    })
-                    continue
-                seen_update_barcodes.add(barcode)
+                # UPDATE. Scoping (pattern B) was already enforced by the
+                # scoped lookup in phase 2: a librarian's dictionary only
+                # contains their own library's copies.
+                # NOTE: only the optional columns are applied; the row's
+                # `library` and `book` cells are validated but do not
+                # move an existing copy.
+                #
+                # Only columns PRESENT in this row are set, and only
+                # those are recorded as touched. Nothing here reads or
+                # relies on an untouched column's current value, so a
+                # concurrent change to a column this row didn't mention
+                # can never be clobbered when this gets written — see
+                # bulk.py for why that matters.
+                touched_columns = set(self.OPTIONAL_COLUMNS) & data.keys()
+                for column in touched_columns:
+                    setattr(existing_copy, column, data[column])
+                to_update.append((existing_copy, touched_columns))
+                continue
 
-                for column in self.OPTIONAL_COLUMNS:
-                    if column in row_data:
-                        setattr(existing_copy, column, row_data[column])
-                to_update.append(existing_copy)
-            else:
-                # LIBRARY SCOPING (pattern C): on CREATE, validate the
-                # row's own `library` column against the requester.
-                if (
-                    requesting_user_library_id is not None
-                    and str(library.pk) != str(requesting_user_library_id)
-                ):
-                    errors.append({
-                        'row': row_number,
-                        'barcode': barcode,
-                        'errors': {'Operation cannot be completed'},
-                    })
-                    continue
+            # CREATE. First, scoping (pattern C).
+            if (
+                requesting_user_library_id is not None
+                and str(library.pk) != str(requesting_user_library_id)
+            ):
+                errors.append({
+                    'row': row_number, 'barcode': barcode,
+                    'errors': {'library': 'You can only import copies for your own library.'},
+                })
+                continue
 
-                create_fields = {
-                    'library': library,
-                    'book': book,
-                    'barcode': barcode,
-                }
-                for column in self.OPTIONAL_COLUMNS:
-                    if column in row_data:
-                        create_fields[column] = row_data[column]
+            if barcode in taken_by_another_library:
+                errors.append({
+                    'row': row_number, 'barcode': barcode,
+                    'errors': {'barcode': 'This barcode is already in use.'},
+                })
+                continue
 
-                # bulk_create skips Model.save(), so acquired_at must be
-                # set explicitly if the CSV didn't supply one.
-                if 'acquired_at' not in create_fields:
-                    create_fields['acquired_at'] = timezone.now()
+            create_fields = {'library': library, 'book': book, 'barcode': barcode}
+            for column in self.OPTIONAL_COLUMNS:
+                if column in data:
+                    create_fields[column] = data[column]
 
-                to_create.append(BookCopy(**create_fields))
+            # bulk_create skips Model.save(), so default acquired_at here.
+            create_fields.setdefault('acquired_at', timezone.now())
+
+            to_create.append(BookCopy(**create_fields))
 
         # ------------------------------------------------------------------
         # PHASE 5: Write everything inside ONE transaction.
         # ------------------------------------------------------------------
-        # Lock the involved Library rows (sorted by pk to avoid deadlocks)
-        # so concurrent imports against the same library can't interleave
-        # their barcode uniqueness checks. Different libraries lock
-        # different rows and never block each other.
         created_count = 0
         updated_count = 0
 
         if to_create or to_update:
             involved_library_pks = sorted(
                 {copy.library_id for copy in to_create}
-                | {copy.library_id for copy in to_update}
+                | {copy.library_id for copy, _touched in to_update}
             )
-            with transaction.atomic():
-                # Acquire locks in deterministic order.
-                list(
-                    Library.objects
-                    .select_for_update()
-                    .filter(pk__in=involved_library_pks)
-                    .order_by('pk')
+            try:
+                with transaction.atomic():
+                    # Lock the involved Library rows in a fixed order
+                    # (sorted by pk -> no deadlocks). no_key=True is the
+                    # lighter "FOR NO KEY UPDATE" lock: concurrent imports
+                    # into the same library still queue up, but unrelated
+                    # inserts that reference the library aren't blocked
+                    # (see BookCopyCreateView for the full explanation).
+                    list(
+                        Library.objects
+                        .select_for_update(no_key=True)
+                        .filter(pk__in=involved_library_pks)
+                        .order_by('pk')
+                    )
+
+                    if to_create:
+                        BookCopy.objects.bulk_create(to_create)
+                        created_count = len(to_create)
+
+                    if to_update:
+                        # Grouped by which fields each row actually
+                        # changed, so an untouched field is never
+                        # written back — see bulk.py.
+                        bulk_update_grouped_by_fields(BookCopy, to_update)
+                        updated_count = len(to_update)
+
+            except IntegrityError:
+                # Someone else created one of these barcodes between our
+                # check in phase 2 and our INSERT. The transaction rolled
+                # back, so nothing was saved and a retry is safe.
+                return Response(
+                    {
+                        'detail': (
+                            'The import conflicted with a concurrent change. '
+                            'Nothing was saved; please retry.'
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
                 )
-
-                if to_create:
-                    BookCopy.objects.bulk_create(to_create)
-                    created_count = len(to_create)
-
-                if to_update:
-                    BookCopy.objects.bulk_update(to_update, fields=BULK_UPDATABLE_FIELDS)
-                    updated_count = len(to_update)
 
         return Response(
             {
