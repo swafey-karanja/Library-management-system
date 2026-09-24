@@ -68,6 +68,7 @@ from .serializers import (
     BookCopyImportRowSerializer,
 )
 from .filters import BookCopyFilter
+from apps.inventory.services import sync_inventory_for_copy, sync_inventory_many
 
 # The only columns a bulk-update request may touch.
 BULK_UPDATABLE_FIELDS = ('status', 'condition', 'shelf_location', 'acquired_at')
@@ -358,6 +359,21 @@ class BookCopyCreateView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        # ---- Sync inventory for every (library, book) pair this
+        # request touched. Deliberately OUTSIDE the transaction.atomic()
+        # block above: sync_inventory() opens its own atomic block per
+        # pair (see inventory/services.py), and nesting it inside the
+        # Library-row lock we just released would mean holding that
+        # lock longer than necessary. Running it after commit also
+        # means a slow inventory sync can never make the Library-row
+        # lock (which blocks other creators for this library) last any
+        # longer than the INSERT itself did.
+        #
+        # A set() collapses e.g. "50 copies of the same book" down to
+        # ONE sync call instead of 50 identical ones.
+        touched_pairs = {(copy.library_id, copy.book_id) for copy in new_copies}
+        sync_inventory_many(touched_pairs)
+
         # `new_copies` already hold their library and book objects, so
         # serializing them triggers no extra queries.
         response_serializer = BookCopySerializer(new_copies, many=True)
@@ -368,19 +384,60 @@ class BookCopyCreateView(APIView):
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
 
+class BookCopyUpdateSerializer(BookCopySerializer):
+    """
+    Used only by BookCopyUpdateView (PUT/PATCH on a single copy).
+
+    Same fields as BookCopySerializer, but `library`, `book` and
+    `barcode` are additionally read-only here:
+
+    - `library` must stay fixed after creation. A barcode bakes in
+      the owning library's code (see barcode.py), so silently moving
+      a copy to another library through this endpoint would leave a
+      barcode that lies about which library the copy belongs to.
+      Transferring a copy between libraries should be a deliberate
+      operation of its own, not a side effect of an ordinary update.
+    - `book` must stay fixed for the same reason: the barcode also
+      encodes the ORIGINAL book's ISBN/title slug.
+    - `barcode` must stay fixed once created. `BookCopy.save()` no
+      longer auto-generates one (see models.py), so leaving this
+      writable would let `PATCH {"barcode": ""}` silently save an
+      empty barcode, and an arbitrary new value could collide with
+      the sequence numbers the create/import views hand out.
+    """
+
+    class Meta(BookCopySerializer.Meta):
+        read_only_fields = BookCopySerializer.Meta.read_only_fields + [
+            'library', 'book', 'barcode',
+        ]
+
+
 class BookCopyUpdateView(LibraryScopedQuerysetMixin, generics.UpdateAPIView):
     permission_classes = [IsAdminOrLibrarian]
     """
     PUT (full) / PATCH (partial) /api/book-copies/<pk>/update/
 
-    LIBRARY SCOPING (pattern A): the whole fix is adding the mixin to
-    the base classes below — nothing else in this view changes. A
-    librarian PATCHing another library's <pk> now gets a 404 (the row
+    LIBRARY SCOPING (pattern A): the mixin scopes the queryset — a
+    librarian PATCHing another library's <pk> gets a 404 (the row
     isn't in their scoped queryset), never a chance to edit it.
+
+    `library`, `book` and `barcode` are read-only on this endpoint —
+    see BookCopyUpdateSerializer above for why.
     """
     queryset = BookCopy.objects.all()
-    serializer_class = BookCopySerializer
+    serializer_class = BookCopyUpdateSerializer
     lookup_field = 'pk'
+
+    def perform_update(self, serializer):
+        # Inventory counts (available/borrowed/reserved) only depend
+        # on `status`. Checking BEFORE save() — via `serializer.
+        # validated_data`, which holds only the fields this request
+        # actually sent — avoids a wasted sync call on requests that
+        # only touched e.g. shelf_location or condition.
+        status_changed = 'status' in serializer.validated_data
+        copy = serializer.save()
+        if status_changed:
+            sync_inventory_for_copy(copy)
 
 
 MAX_BULK_UPDATE_SIZE = 1000
@@ -501,7 +558,21 @@ class BookCopyBulkUpdateView(APIView):
 
             bulk_update_grouped_by_fields(BookCopy, rows_to_write)
 
-        # ---- 6. Serialize the in-memory objects we just updated. ----
+        # ---- 6. Sync inventory for pairs whose STATUS actually changed. ----
+        # total/available/borrowed/reserved only depend on `status`, so
+        # a request that only touched e.g. shelf_location needs no sync
+        # at all. Outside transaction.atomic() for the same reason as
+        # the create view: sync_inventory() manages its own per-pair
+        # transaction and shouldn't extend how long this view's locks
+        # (implicit, from the UPDATE statements above) are held.
+        touched_pairs = {
+            (copy.library_id, copy.book_id)
+            for copy, touched_fields in rows_to_write
+            if 'status' in touched_fields
+        }
+        sync_inventory_many(touched_pairs)
+
+        # ---- 7. Serialize the in-memory objects we just updated. ----
         response_serializer = BookCopySerializer(
             copies_by_id.values(), many=True
         )
@@ -590,6 +661,31 @@ class BookCopyExportView(LibraryScopedQuerysetMixin, generics.GenericAPIView):
             {'detail': f"Unsupported format '{export_format}'. Use 'csv' or 'json'."},
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    def perform_content_negotiation(self, request, force=False):
+        """
+        Bypass DRF's Accept-header / `?format=` negotiation entirely.
+
+        WHY: `?format=csv` was returning a 404 before get() ever ran,
+        with no way to reach the "Unsupported format" branch above.
+        The cause is a naming collision: DRF's own `APIView.initial()`
+        unconditionally reads the query parameter named by
+        `URL_FORMAT_OVERRIDE` (default: `"format"`) and uses it to
+        pick a *renderer* out of `renderer_classes` (default:
+        JSONRenderer + BrowsableAPIRenderer, i.e. formats "json" and
+        "api"). "csv" matches neither, so DRF's own negotiation raises
+        `Http404` in `initial()` — before this view's `get()`, and
+        this endpoint's OWN meaning of `?format=`, are ever reached.
+
+        This view never returns a DRF `Response` for the actual
+        export (only for the 400 error case above), so it never
+        depends on DRF picking a renderer in the first place. The
+        real request format is decided by `get()` above using this
+        same `?format=` value — DRF's negotiation is redundant here
+        and only exists to get in the way, so it's replaced with a
+        fixed, always-succeeding choice.
+        """
+        return (self.renderer_classes[0](), self.renderer_classes[0].media_type)
 
     # ------------------------------------------------------------------
     # CSV
@@ -1023,6 +1119,24 @@ class BookCopyImportView(APIView):
                     },
                     status=status.HTTP_409_CONFLICT,
                 )
+
+            # ---- Sync inventory. Outside the transaction above for the
+            # same reason as the other views: each sync_inventory() call
+            # manages its own short transaction and shouldn't extend how
+            # long the Library-row locks above are held.
+            #
+            # Every created copy changes a count (a brand-new copy is
+            # always +1 to total and to whichever status it starts in),
+            # so all of `to_create`'s pairs need a sync. An updated copy
+            # only needs one if its `status` was among the columns this
+            # CSV row actually touched.
+            touched_pairs = {(copy.library_id, copy.book_id) for copy in to_create}
+            touched_pairs |= {
+                (copy.library_id, copy.book_id)
+                for copy, touched_fields in to_update
+                if 'status' in touched_fields
+            }
+            sync_inventory_many(touched_pairs)
 
         return Response(
             {
