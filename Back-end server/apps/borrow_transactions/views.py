@@ -30,7 +30,13 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.generics import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 
-from core.permissions import IsAdminOrLibrarian, LibraryScopedQuerysetMixin, scope_queryset_to_library
+from core.permissions import (
+    IsAdminOrLibrarian,
+    LibraryScopedQuerysetMixin,
+    get_user_library_id,
+    scope_queryset_to_library,
+)
+from apps.members.models import Status as MemberStatus
 from .models import BorrowTransaction
 from .serializers import (
     BorrowTransactionSerializer,
@@ -119,6 +125,43 @@ def _get_active_loan_limit(library):
 def _count_active_loans(member):
     """How many not-yet-returned transactions this member currently has."""
     return BorrowTransaction.objects.filter(member=member, returned_at__isnull=True).count()
+
+
+def _member_checkout_error(member, user):
+    """
+    Checks the MEMBER half of a checkout request. Returns a ready-made
+    error Response if this member can't be lent to by `user`, or None
+    if the checkout may carry on. Shared by the single and batch
+    checkout views so the two can't drift apart.
+
+    Why this exists: the checkout serializers look the member up in the
+    WHOLE members table (any library's member is accepted), and the
+    views only ever scoped the book COPY. So a librarian could lend
+    their own library's copy to a member of a different library. Two
+    rules close that, plus the "active members only" business rule:
+
+      1. A non-admin user may only lend to members of THEIR OWN library.
+         Another library's member gets the same 404 as an id that
+         doesn't exist, so the response never confirms that the id is
+         real. (An admin has no library, so this rule skips them.)
+      2. The member must be active. New members start 'inactive' until
+         they confirm their email, so they can't borrow before that.
+
+    A third rule — the member and the copy must belong to the SAME
+    library — needs the copy, so the views check it once the copy has
+    been fetched (that check also covers admins).
+    """
+    user_library_id = get_user_library_id(user)  # None for an admin
+    if user_library_id is not None and member.library_id != user_library_id:
+        return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if member.status != MemberStatus.ACTIVE:
+        return Response(
+            {'detail': 'This member is not active and cannot borrow books.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    return None
 
 
 class BorrowTransactionListView(LibraryScopedQuerysetMixin, generics.ListAPIView):
@@ -338,6 +381,11 @@ class BorrowCheckoutView(APIView):
         member = data['member']
         BookCopyModel = book_copy.__class__
 
+        # Who may borrow: right library, and an active member.
+        member_error = _member_checkout_error(member, request.user)
+        if member_error is not None:
+            return member_error
+
         # Loan-limit check. Deliberately a plain count, not locked with
         # select_for_update — a member's "how many books do I have out"
         # isn't a single row we can lock the way a specific BookCopy
@@ -367,6 +415,17 @@ class BorrowCheckoutView(APIView):
                 ).get(pk=book_copy.pk)
             except BookCopyModel.DoesNotExist:
                 return Response({'detail': 'Book copy not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            # The copy and the member must belong to the same library.
+            # For a librarian this can't fail any more (both were already
+            # restricted to their library above), but an ADMIN is not
+            # restricted to one library, so without this check an admin
+            # could pair library A's copy with library B's member.
+            if book_copy.library_id != member.library_id:
+                return Response(
+                    {'detail': 'The member and the book copy must belong to the same library.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             if book_copy.status != book_copy.STATUS_AVAILABLE:
                 return Response(
@@ -421,6 +480,11 @@ class BorrowBatchCheckoutView(APIView):
         # between the borrow_transactions and book_copies apps.
         BookCopyModel = book_copies[0].__class__
 
+        # Who may borrow: right library, and an active member.
+        member_error = _member_checkout_error(member, request.user)
+        if member_error is not None:
+            return member_error
+
         # Loan-limit check: existing active loans PLUS everything in
         # THIS batch, since a member could otherwise check out several
         # books in one request and blow past their limit in one shot,
@@ -463,6 +527,15 @@ class BorrowBatchCheckoutView(APIView):
                 copy = locked_by_id.get(copy_id)
                 if copy is None:
                     errors.append({'book_copy': str(copy_id), 'error': 'Not found.'})
+                elif copy.library_id != member.library_id:
+                    # Only reachable by an admin (a librarian's copies are
+                    # already limited to their own library, and so is the
+                    # member) — same rule as the single checkout view.
+                    errors.append({
+                        'book_copy': str(copy_id),
+                        'barcode': copy.barcode,
+                        'error': 'Belongs to a different library than the member.',
+                    })
                 elif copy.status != copy.STATUS_AVAILABLE:
                     errors.append({
                         'book_copy': str(copy_id),
@@ -476,7 +549,7 @@ class BorrowBatchCheckoutView(APIView):
                 # back; the transaction just commits empty.
                 return Response(
                     {
-                        'detail': 'One or more copies are not available. No transactions were created.',
+                        'detail': 'One or more copies cannot be checked out. No transactions were created.',
                         'errors': errors,
                     },
                     status=status.HTTP_409_CONFLICT,
@@ -521,32 +594,84 @@ class BorrowReturnView(APIView):
 
     Marks the loan returned, calculates any fine, and puts the copy
     back on the shelf (or into "damaged" if a condition was given).
+
+    CONCURRENCY (why the code below is ordered the way it is)
+    ---------------------------------------------------------
+    Two requests can arrive for the SAME loan at nearly the same moment
+    (a double scan, or a browser retry after a slow response). The rule
+    that keeps that safe is:
+
+        LOCK the rows  ->  THEN check their state  ->  THEN write.
+
+    An earlier version read the loan with a plain query and checked
+    `returned_at` BEFORE opening the transaction. Both requests could
+    pass that check, because neither had written anything yet. Both
+    then "returned" the loan, and — worse — both called
+    assign_or_release_book_copy(): the first handed the copy to the
+    oldest waiting reservation, the second saw that reservation was no
+    longer waiting and handed the SAME physical copy to the next one.
+
+    Now the loan (and its copy) are locked with SELECT ... FOR NO KEY
+    UPDATE inside the atomic block. A second request for the same loan
+    simply waits at the lock; once the first commits, the second reads
+    the FRESH row, sees `returned_at` is already set, and gets a clean
+    400 without touching anything.
     """
     permission_classes = [IsAdminOrLibrarian]
 
     def post(self, request, *args, **kwargs):
-        # SCOPING: plain pk lookup by URL <pk>, no serializer queryset
-        # to fall back on — scope_queryset_to_library() is the only
-        # gate here. A transaction outside the caller's library is
-        # absent from the scoped queryset, so .get() raises
-        # DoesNotExist -> the SAME 404 already used for a bad pk below.
-        try:
-            borrow_transaction = scope_queryset_to_library(
-                BorrowTransaction.objects.select_related('book_copy'),
-                request.user,
-                library_lookup=BORROW_TRANSACTION_LIBRARY_LOOKUP,
-            ).get(pk=kwargs['pk'])
-        except BorrowTransaction.DoesNotExist:
-            return Response({'detail': 'Borrow transaction not found.'}, status=status.HTTP_404_NOT_FOUND)
-
-        if borrow_transaction.returned_at is not None:
-            return Response({'detail': 'This transaction has already been returned.'}, status=status.HTTP_400_BAD_REQUEST)
-
+        # STEP 1 — validate the request body BEFORE taking any lock.
+        # This is pure in-memory work (it never queries the database),
+        # so there is no reason to make other requests wait while we do it.
         input_serializer = BorrowReturnSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         data = input_serializer.validated_data
 
         with transaction.atomic():
+            # STEP 2 — fetch AND lock the loan together with its copy,
+            # in one query.
+            #
+            # select_for_update(...) adds "FOR NO KEY UPDATE" to the SQL.
+            # Postgres then makes any other transaction that wants to
+            # lock or change these same rows WAIT until we commit or roll
+            # back (that waiting is what serializes the two requests).
+            #
+            #  - of=('self', 'book_copy'): lock exactly the loan row
+            #    ('self') and its copy row, and NOTHING else. Without
+            #    `of`, Postgres locks every table in the join.
+            #  - no_key=True: "FOR NO KEY UPDATE" instead of plain
+            #    "FOR UPDATE". We only change non-key columns
+            #    (status, returned_at, fine_amount, condition), and this
+            #    weaker lock does not block unrelated inserts that merely
+            #    REFERENCE these rows through a foreign key (for example a
+            #    reservation being assigned to this copy).
+            #
+            # SCOPING: scope_queryset_to_library() is still the only
+            # library gate here. A loan from another library is absent
+            # from the scoped queryset, so .get() raises DoesNotExist ->
+            # the same 404 as a genuinely unknown pk.
+            try:
+                borrow_transaction = scope_queryset_to_library(
+                    BorrowTransaction.objects
+                    .select_related('book_copy')
+                    .select_for_update(of=('self', 'book_copy'), no_key=True),
+                    request.user,
+                    library_lookup=BORROW_TRANSACTION_LIBRARY_LOOKUP,
+                ).get(pk=kwargs['pk'])
+            except BorrowTransaction.DoesNotExist:
+                return Response({'detail': 'Borrow transaction not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            # STEP 3 — the authoritative state check, now that we hold the
+            # lock. If a concurrent request returned this loan first, we
+            # were blocked at the query above and `borrow_transaction`
+            # already reflects its committed result. Nothing has been
+            # written yet, so returning here just commits an empty
+            # transaction.
+            if borrow_transaction.returned_at is not None:
+                return Response({'detail': 'This transaction has already been returned.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # STEP 4 — the writes. Safe: nobody else can touch this loan
+            # or this copy until the atomic block ends.
             borrow_transaction.returned_at = data.get('returned_at') or timezone.now()
             # Fine is computed off due_date vs returned_at, then locked in.
             borrow_transaction.fine_amount = borrow_transaction.calculate_fine()
@@ -566,7 +691,14 @@ class BorrowReturnView(APIView):
                 # copy — only reaches here when it's genuinely returnable.
                 # It syncs inventory itself (see reservations/services.py).
                 assign_or_release_book_copy(book_copy)
-            book_copy.save(update_fields=['status', 'condition'])
+
+            # NOTE: there used to be a final
+            #     book_copy.save(update_fields=['status', 'condition'])
+            # here. It was redundant (set_copy_status() above has already
+            # saved the status, and the condition was saved just before),
+            # and it re-wrote both columns from an in-memory copy of the
+            # row that had been read earlier — a way to silently overwrite
+            # a concurrent change. Removed.
 
         notify_return([borrow_transaction.id])
 
@@ -756,7 +888,15 @@ class BorrowTransactionStatisticsView(APIView):
     """
 
     def get(self, request, *args, **kwargs):
-        queryset = BorrowTransaction.objects.all()
+        # SCOPING: this plain APIView has no get_queryset() for the
+        # mixin to hook into, so the queryset is scoped by hand. Every
+        # number below is derived from it, so a librarian only ever
+        # counts their own library's loans (admins still see all).
+        queryset = scope_queryset_to_library(
+            BorrowTransaction.objects.all(),
+            request.user,
+            library_lookup=BORROW_TRANSACTION_LIBRARY_LOOKUP,
+        )
 
         # GROUP BY status, then fill in any status with zero rows so
         # the frontend doesn't have to guess "missing" vs "zero".
