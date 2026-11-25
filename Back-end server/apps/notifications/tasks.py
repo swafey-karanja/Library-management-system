@@ -131,34 +131,42 @@ def send_return_email(self, transaction_ids):
         logger.warning("send_return_email: no transactions found for ids %s", transaction_ids)
         return
 
-    member = transactions[0].member
-    if not member.email:
-        logger.info("send_return_email: member %s has no email on file, skipping", member.member_id)
-        return
+    # One email PER MEMBER. The views only ever send one member's loans
+    # at a time, but grouping here means a mixed list could never put one
+    # member's titles and fines into another member's email.
+    by_member = {}
+    for txn in transactions:
+        by_member.setdefault(txn.member_id, []).append(txn)
 
-    books = [
-        {
-            "title": txn.book_copy.book.title,
-            "barcode": txn.book_copy.barcode,
-            "returned_at": txn.returned_at,
-            "fine_amount": txn.fine_amount,
-        }
-        for txn in transactions
-    ]
-    total_fines = sum((book["fine_amount"] for book in books), Decimal("0.00"))
+    for member_transactions in by_member.values():
+        member = member_transactions[0].member
+        if not member.email:
+            logger.info("send_return_email: member %s has no email on file, skipping", member.member_id)
+            continue
 
-    subject = "You've returned a book" if len(books) == 1 else f"You've returned {len(books)} books"
+        books = [
+            {
+                "title": txn.book_copy.book.title,
+                "barcode": txn.book_copy.barcode,
+                "returned_at": txn.returned_at,
+                "fine_amount": txn.fine_amount,
+            }
+            for txn in member_transactions
+        ]
+        total_fines = sum((book["fine_amount"] for book in books), Decimal("0.00"))
 
-    try:
-        _send_email(
-            subject=subject,
-            template_base="return",
-            context={"member": member, "books": books, "total_fines": total_fines},
-            to_email=member.email,
-        )
-    except Exception as exc:
-        logger.exception("send_return_email failed for member %s", member.member_id)
-        raise self.retry(exc=exc)
+        subject = "You've returned a book" if len(books) == 1 else f"You've returned {len(books)} books"
+
+        try:
+            _send_email(
+                subject=subject,
+                template_base="return",
+                context={"member": member, "books": books, "total_fines": total_fines},
+                to_email=member.email,
+            )
+        except Exception as exc:
+            logger.exception("send_return_email failed for member %s", member.member_id)
+            raise self.retry(exc=exc)
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)

@@ -7,6 +7,7 @@ Converts BorrowTransaction <-> JSON and validates input before saving.
 from rest_framework import serializers
 
 from .models import BorrowTransaction
+from decimal import Decimal
 
 
 class BorrowTransactionSerializer(serializers.ModelSerializer):
@@ -74,6 +75,8 @@ class BorrowTransactionUpdateSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = ['id', 'created_at']
+        # A fine can be waived (0.00) but never negative.
+        extra_kwargs = {'fine_amount': {'min_value': Decimal('0.00')}}
 
 
 # Fields a bulk-update request may touch. book_copy/member reassignment
@@ -89,7 +92,9 @@ class BorrowTransactionBulkUpdateItemSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=BorrowTransaction.STATUS_CHOICES, required=False)
     due_date = serializers.DateTimeField(required=False)
     returned_at = serializers.DateTimeField(required=False, allow_null=True)
-    fine_amount = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
+    fine_amount = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False, min_value=Decimal('0.00')
+    )
 
 
 class BorrowCheckoutSerializer(serializers.Serializer):
@@ -113,8 +118,13 @@ class BorrowCheckoutSerializer(serializers.Serializer):
     due_date = serializers.DateTimeField(required=False)
 
     def validate_book_copy(self, book_copy):
-        """A copy can only be borrowed if it's actually on the shelf."""
-        if book_copy.status != book_copy.STATUS_AVAILABLE:
+        """
+        Quick early rejection of copies that can never be borrowed.
+        A 'reserved' copy passes: it may be the member's own hold being
+        picked up. Whether it really IS that member's hold is checked in
+        the view, under a lock (_check_checkout_holds).
+        """
+        if book_copy.status not in (book_copy.STATUS_AVAILABLE, book_copy.STATUS_RESERVED):
             raise serializers.ValidationError(
                 f'This copy is not available to borrow (current status: {book_copy.status}).'
             )

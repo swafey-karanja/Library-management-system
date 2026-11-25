@@ -44,11 +44,13 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.book_copies.models import BookCopy
 from apps.books.models import Book
+from apps.borrow_transactions import views as borrow_views
 from apps.borrow_transactions.models import BorrowTransaction
 from apps.borrow_transactions.views import (
     BorrowBatchCheckoutView,
     BorrowCheckoutView,
     BorrowReturnView,
+    BorrowTransactionBulkUpdateView,
     BorrowTransactionStatisticsView,
     BorrowTransactionUpdateView,
 )
@@ -407,3 +409,432 @@ class UpdateAndStatisticsIsolationTests(TestCase):
         # Admins still see everything (>= because a real database may hold other rows).
         as_admin = _call(BorrowTransactionStatisticsView, "get", self.admin)
         self.assertGreaterEqual(as_admin.data["total_transactions"], 4)
+
+
+# ---------------------------------------------------------------------------
+# C2 — librarian corrections (PATCH /<pk>/update/ and PATCH /bulk-update/)
+# ---------------------------------------------------------------------------
+
+def _sql(queries):
+    """Captured SQL statements with whitespace collapsed, for easy matching."""
+    return [re.sub(r"\s+", " ", q["sql"]) for q in queries.captured_queries]
+
+
+def _updates_to(statements, table):
+    return [s for s in statements if s.startswith(f'UPDATE "{table}"')]
+
+
+class LoanCorrectionTests(TestCase):
+    """PATCH /api/borrow-transactions/<pk>/update/"""
+
+    def setUp(self):
+        self.library = make_library()
+        self.librarian = make_librarian(self.library)
+        self.book = make_book()
+        self.member = make_member(self.library)
+        self.copy = make_copy(self.library, self.book)          # 'checked_out'
+        self.loan = make_loan(self.copy, self.member)           # active, due in ~11 days
+
+    def update(self, body, pk=None, user=None):
+        return _call(BorrowTransactionUpdateView, "patch", user or self.librarian, body, pk=pk or self.loan.pk)
+
+    def reload(self):
+        self.loan.refresh_from_db()
+        self.copy.refresh_from_db()
+
+    def mark_returned_in_db(self):
+        """Puts the loan into the 'returned' state, with its copy back on the shelf."""
+        BorrowTransaction.objects.filter(pk=self.loan.pk).update(
+            status=BorrowTransaction.STATUS_RETURNED, returned_at=timezone.now()
+        )
+        BookCopy.objects.filter(pk=self.copy.pk).update(status=BookCopy.STATUS_AVAILABLE)
+
+    # -- locking / what gets written ----------------------------------------
+
+    def test_row_is_locked_and_only_the_sent_column_is_written(self):
+        new_due = (timezone.now() + timedelta(days=30)).isoformat()
+        with CaptureQueriesContext(connection) as queries:
+            self.assertEqual(self.update({"due_date": new_due}).status_code, 200)
+        statements = _sql(queries)
+
+        self.assertTrue(
+            any(s.endswith('FOR NO KEY UPDATE OF "borrow_transactions", "book_copies"') for s in statements),
+            "the loan and its copy must be locked before they are changed",
+        )
+        updates = _updates_to(statements, "borrow_transactions")
+        self.assertEqual(len(updates), 1)
+        set_clause = re.search(r"SET (.*) WHERE", updates[0]).group(1)
+        self.assertIn('"due_date"', set_clause)
+        for untouched in ("status", "returned_at", "fine_amount", "member_id", "book_copy_id", "borrowed_at", "created_at"):
+            self.assertNotIn(f'"{untouched}"', set_clause, f"{untouched} must not be rewritten")
+
+    def test_request_that_changes_nothing_writes_nothing(self):
+        with CaptureQueriesContext(connection) as queries:
+            self.assertEqual(self.update({"status": "active"}).status_code, 200)
+        statements = _sql(queries)
+        self.assertEqual(_updates_to(statements, "borrow_transactions"), [])
+        self.assertEqual(_updates_to(statements, "book_copies"), [])
+
+    def test_fine_waiver_changes_only_the_fine(self):
+        BorrowTransaction.objects.filter(pk=self.loan.pk).update(fine_amount=Decimal("2.50"))
+        self.assertEqual(self.update({"fine_amount": "0.00"}).status_code, 200)
+        self.reload()
+        self.assertEqual(self.loan.fine_amount, Decimal("0.00"))
+        self.assertEqual(self.loan.status, BorrowTransaction.STATUS_ACTIVE)
+        self.assertEqual(self.copy.status, BookCopy.STATUS_BORROWED)
+
+    def test_negative_fine_is_rejected(self):
+        self.assertEqual(self.update({"fine_amount": "-1.00"}).status_code, 400)
+
+    # -- status changes and the copy ----------------------------------------
+
+    def test_marking_returned_sets_date_fine_and_releases_copy(self):
+        late = make_loan(make_copy(self.library, self.book), self.member, days_ago=20)   # 6 days late
+        self.assertEqual(self.update({"status": "returned"}, pk=late.pk).status_code, 200)
+        late.refresh_from_db()
+        self.assertEqual(late.status, "returned")
+        self.assertIsNotNone(late.returned_at)
+        self.assertEqual(late.fine_amount, Decimal("3.00"))
+        late.book_copy.refresh_from_db()
+        self.assertEqual(late.book_copy.status, BookCopy.STATUS_AVAILABLE)
+
+    def test_marking_returned_hands_copy_to_oldest_waiter(self):
+        oldest = make_waiting_reservation(self.library, self.book, make_member(self.library), 20)
+        newer = make_waiting_reservation(self.library, self.book, make_member(self.library), 10)
+        self.assertEqual(self.update({"status": "returned"}).status_code, 200)
+        oldest.refresh_from_db(); newer.refresh_from_db(); self.copy.refresh_from_db()
+        self.assertEqual((oldest.status, newer.status, self.copy.status), ("reserved", "waiting", "reserved"))
+
+    def test_marking_returned_leaves_a_copy_held_for_someone_else_alone(self):
+        # The copy was already handed to another member's hold; this loan record
+        # being corrected to 'returned' must not hand it out a second time.
+        BookCopy.objects.filter(pk=self.copy.pk).update(status=BookCopy.STATUS_RESERVED)
+        waiting = make_waiting_reservation(self.library, self.book, make_member(self.library))
+        self.assertEqual(self.update({"status": "returned"}).status_code, 200)
+        self.reload(); waiting.refresh_from_db()
+        self.assertEqual(self.loan.status, "returned")
+        self.assertEqual(self.copy.status, BookCopy.STATUS_RESERVED)
+        self.assertEqual(waiting.status, Reservation.STATUS_WAITING)
+
+    def test_marking_lost_marks_the_copy_lost(self):
+        self.assertEqual(self.update({"status": "lost"}).status_code, 200)
+        self.reload()
+        self.assertEqual((self.loan.status, self.loan.returned_at, self.copy.status), ("lost", None, "lost"))
+
+    def test_lost_loan_found_and_returned_puts_copy_back(self):
+        self.update({"status": "lost"})
+        self.assertEqual(self.update({"status": "returned"}).status_code, 200)
+        self.reload()
+        self.assertEqual((self.loan.status, self.copy.status), ("returned", "available"))
+
+    def test_reopening_a_returned_loan_checks_the_copy_out_again(self):
+        self.mark_returned_in_db()
+        self.assertEqual(self.update({"status": "active"}).status_code, 200)
+        self.reload()
+        self.assertEqual((self.loan.status, self.loan.returned_at, self.copy.status), ("active", None, "checked_out"))
+
+    def test_reopening_is_refused_when_the_copy_is_no_longer_available(self):
+        self.mark_returned_in_db()
+        BookCopy.objects.filter(pk=self.copy.pk).update(status=BookCopy.STATUS_RESERVED)
+        self.assertEqual(self.update({"status": "active"}).status_code, 409)
+        self.reload()
+        self.assertEqual((self.loan.status, self.copy.status), ("returned", "reserved"))
+        self.assertIsNotNone(self.loan.returned_at)
+
+    def test_a_returned_loan_cannot_be_marked_lost(self):
+        self.mark_returned_in_db()
+        self.assertEqual(self.update({"status": "lost"}).status_code, 400)
+
+    # -- status / returned_at must agree, dates must make sense --------------
+
+    def test_returned_status_cannot_have_empty_returned_at(self):
+        self.assertEqual(self.update({"status": "returned", "returned_at": None}).status_code, 400)
+        self.reload()
+        self.assertEqual(self.loan.status, "active")
+
+    def test_returned_at_is_only_allowed_on_a_returned_loan(self):
+        self.assertEqual(self.update({"returned_at": timezone.now().isoformat()}).status_code, 400)
+        self.assertEqual(
+            self.update({"status": "lost", "returned_at": timezone.now().isoformat()}).status_code, 400
+        )
+
+    def test_returned_at_before_borrowed_at_is_rejected(self):
+        before = (self.loan.borrowed_at - timedelta(days=1)).isoformat()
+        self.assertEqual(self.update({"status": "returned", "returned_at": before}).status_code, 400)
+
+    def test_returned_at_in_the_future_is_rejected(self):
+        later = (timezone.now() + timedelta(days=2)).isoformat()
+        self.assertEqual(self.update({"status": "returned", "returned_at": later}).status_code, 400)
+
+    def test_due_date_before_borrowed_at_is_rejected(self):
+        before = (self.loan.borrowed_at - timedelta(days=1)).isoformat()
+        self.assertEqual(self.update({"due_date": before}).status_code, 400)
+
+    # -- scoping -------------------------------------------------------------
+
+    def test_other_librarys_loan_is_404_and_unchanged(self):
+        outsider = make_librarian(make_library())
+        self.assertEqual(self.update({"status": "lost"}, user=outsider).status_code, 404)
+        self.reload()
+        self.assertEqual((self.loan.status, self.copy.status), ("active", "checked_out"))
+
+
+class BulkCorrectionTests(TestCase):
+    """PATCH /api/borrow-transactions/bulk-update/"""
+
+    def setUp(self):
+        self.library = make_library()
+        self.librarian = make_librarian(self.library)
+        self.book = make_book()
+        self.member = make_member(self.library)
+
+    def new_loan(self):
+        return make_loan(make_copy(self.library, self.book), self.member)
+
+    def bulk(self, items, user=None):
+        return _call(BorrowTransactionBulkUpdateView, "patch", user or self.librarian, items)
+
+    def test_updates_every_item_syncs_copies_and_keeps_request_order(self):
+        first, second = self.new_loan(), self.new_loan()
+        response = self.bulk([
+            {"id": str(second.pk), "status": "returned"},
+            {"id": str(first.pk), "status": "lost"},
+        ])
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual([row["id"] for row in response.data], [str(second.pk), str(first.pk)])
+        for loan in (first, second):
+            loan.refresh_from_db(); loan.book_copy.refresh_from_db()
+        self.assertEqual((second.status, second.book_copy.status), ("returned", "available"))
+        self.assertEqual((first.status, first.book_copy.status), ("lost", "lost"))
+
+    def test_is_all_or_nothing(self):
+        good = self.new_loan()
+        bad = self.new_loan()
+        BorrowTransaction.objects.filter(pk=bad.pk).update(status="returned", returned_at=timezone.now())
+        new_due = (timezone.now() + timedelta(days=40)).isoformat()
+
+        response = self.bulk([
+            {"id": str(good.pk), "due_date": new_due},
+            {"id": str(bad.pk), "status": "lost"},          # a returned loan can't become lost
+        ])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["id"], str(bad.pk))
+        good.refresh_from_db()
+        self.assertLess(good.due_date, timezone.now() + timedelta(days=20))   # first item rolled back
+
+    def test_oversized_batch_is_rejected(self):
+        limit = borrow_views.MAX_BULK_UPDATE_SIZE
+        items = [{"id": str(uuid.uuid4()), "status": "lost"} for _ in range(limit + 1)]
+        self.assertEqual(self.bulk(items).status_code, 400)
+
+    def test_duplicate_ids_are_rejected(self):
+        loan = self.new_loan()
+        item = {"id": str(loan.pk), "status": "lost"}
+        self.assertEqual(self.bulk([item, item]).status_code, 400)
+
+    def test_unknown_or_other_library_ids_are_reported_missing(self):
+        foreign = make_loan(make_copy(make_library(), make_book()), make_member(make_library()))
+        response = self.bulk([{"id": str(foreign.pk), "status": "lost"}])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["missing_ids"], [str(foreign.pk)])
+
+    def test_loans_are_locked_and_only_sent_columns_written(self):
+        loans = [self.new_loan(), self.new_loan()]
+        new_due = (timezone.now() + timedelta(days=30)).isoformat()
+        with CaptureQueriesContext(connection) as queries:
+            response = self.bulk([{"id": str(l.pk), "due_date": new_due} for l in loans])
+        self.assertEqual(response.status_code, 200, response.data)
+        statements = _sql(queries)
+        self.assertTrue(any(s.endswith('FOR NO KEY UPDATE OF "borrow_transactions", "book_copies"') for s in statements))
+        for update in _updates_to(statements, "borrow_transactions"):
+            set_clause = re.search(r"SET (.*) WHERE", update).group(1)
+            self.assertEqual(set_clause.count("="), 1, set_clause)
+            self.assertIn('"due_date"', set_clause)
+
+    def test_number_of_selects_does_not_grow_with_batch_size(self):
+        """The response used to lazy-load member and book once per row (2 extra queries each)."""
+        def selects_for(n):
+            loans = [self.new_loan() for _ in range(n)]
+            new_due = (timezone.now() + timedelta(days=30 + n)).isoformat()
+            with CaptureQueriesContext(connection) as queries:
+                self.assertEqual(self.bulk([{"id": str(l.pk), "due_date": new_due} for l in loans]).status_code, 200)
+            return sum(1 for s in _sql(queries) if s.startswith("SELECT"))
+
+        self.assertEqual(selects_for(2), selects_for(6))
+
+
+# ---------------------------------------------------------------------------
+# C4 — picking up a copy that is being held for a member
+# ---------------------------------------------------------------------------
+
+def make_hold(library, book, member, copy, expires_in=timedelta(days=2)):
+    """A reservation that has been given a copy: status 'reserved'."""
+    return Reservation.objects.create(
+        library=library, book=book, member=member, book_copy=copy,
+        status=Reservation.STATUS_RESERVED,
+        reserved_at=timezone.now() - timedelta(hours=1),
+        expires_at=timezone.now() + expires_in,
+    )
+
+
+class ReservedPickupTests(TestCase):
+    """
+    A copy that has been put on hold ('reserved') for a member must be
+    borrowable BY THAT MEMBER (and nobody else), and borrowing it must
+    close the hold.
+    """
+
+    def setUp(self):
+        self.library = make_library()
+        self.librarian = make_librarian(self.library)
+        self.book = make_book()
+        self.holder = make_member(self.library)
+        self.other = make_member(self.library)
+        self.copy = make_copy(self.library, self.book, status=BookCopy.STATUS_RESERVED)
+        self.hold = make_hold(self.library, self.book, self.holder, self.copy)
+
+    def checkout(self, member, copy=None):
+        return _call(
+            BorrowCheckoutView, "post", self.librarian,
+            {"book_copy": str((copy or self.copy).pk), "member": str(member.pk)},
+        )
+
+    def batch(self, member, copies):
+        return _call(
+            BorrowBatchCheckoutView, "post", self.librarian,
+            {"member": str(member.pk), "book_copies": [str(c.pk) for c in copies]},
+        )
+
+    def assert_hold_untouched(self):
+        self.copy.refresh_from_db()
+        self.hold.refresh_from_db()
+        self.assertEqual(self.copy.status, BookCopy.STATUS_RESERVED)
+        self.assertEqual(self.hold.status, Reservation.STATUS_RESERVED)
+        self.assertFalse(BorrowTransaction.objects.filter(book_copy=self.copy).exists())
+
+    # -- single -------------------------------------------------------------
+
+    def test_holder_can_pick_up_and_the_hold_is_closed(self):
+        response = self.checkout(self.holder)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.copy.refresh_from_db()
+        self.hold.refresh_from_db()
+        self.assertEqual(self.copy.status, BookCopy.STATUS_BORROWED)
+        self.assertEqual(self.hold.status, Reservation.STATUS_CHECKED_OUT)
+        inv = Inventory.objects.get(library=self.library, book=self.book)
+        self.assertEqual((inv.borrowed_copies, inv.reserved_copies), (1, 0))
+
+    def test_someone_else_cannot_take_a_held_copy(self):
+        response = self.checkout(self.other)
+        self.assertEqual(response.status_code, 409)
+        self.assert_hold_untouched()
+
+    def test_expired_hold_cannot_be_picked_up(self):
+        Reservation.objects.filter(pk=self.hold.pk).update(
+            expires_at=timezone.now() - timedelta(minutes=1)
+        )
+        response = self.checkout(self.holder)
+        self.assertEqual(response.status_code, 409)
+        self.assert_hold_untouched()
+
+    def test_reserved_copy_with_no_hold_row_is_refused(self):
+        Reservation.objects.filter(pk=self.hold.pk).update(status=Reservation.STATUS_CANCELLED)
+        response = self.checkout(self.holder)
+        self.assertEqual(response.status_code, 409)
+        self.copy.refresh_from_db()
+        self.assertEqual(self.copy.status, BookCopy.STATUS_RESERVED)
+
+    def test_other_states_are_still_refused(self):
+        lost = make_copy(self.library, self.book, status=BookCopy.STATUS_LOST)
+        self.assertEqual(self.checkout(self.holder, copy=lost).status_code, 400)  # serializer rejects it early
+
+    def test_lock_is_taken_on_the_reservation_row(self):
+        with CaptureQueriesContext(connection) as ctx:
+            self.checkout(self.holder)
+        locks = [q for q in _sql(ctx)
+                 if 'FROM "reservations"' in q and "FOR NO KEY UPDATE" in q]
+        self.assertTrue(locks, "reservation row must be locked when claiming a hold")
+
+    # -- batch --------------------------------------------------------------
+
+    def test_batch_mixes_a_pickup_and_a_shelf_copy(self):
+        shelf = make_copy(self.library, self.book, status=BookCopy.STATUS_AVAILABLE)
+        response = self.batch(self.holder, [self.copy, shelf])
+        self.assertEqual(response.status_code, 201, response.data)
+        self.copy.refresh_from_db(); shelf.refresh_from_db(); self.hold.refresh_from_db()
+        self.assertEqual(self.copy.status, BookCopy.STATUS_BORROWED)
+        self.assertEqual(shelf.status, BookCopy.STATUS_BORROWED)
+        self.assertEqual(self.hold.status, Reservation.STATUS_CHECKED_OUT)
+        inv = Inventory.objects.get(library=self.library, book=self.book)
+        self.assertEqual((inv.borrowed_copies, inv.reserved_copies), (2, 0))
+
+    def test_batch_with_someone_elses_hold_is_all_or_nothing(self):
+        shelf = make_copy(self.library, self.book, status=BookCopy.STATUS_AVAILABLE)
+        response = self.batch(self.other, [shelf, self.copy])
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual([e["book_copy"] for e in response.data["errors"]], [str(self.copy.pk)])
+        shelf.refresh_from_db()
+        self.assertEqual(shelf.status, BookCopy.STATUS_AVAILABLE)
+        self.assert_hold_untouched()
+
+    def test_batch_with_expired_hold_is_refused(self):
+        Reservation.objects.filter(pk=self.hold.pk).update(
+            expires_at=timezone.now() - timedelta(minutes=1)
+        )
+        response = self.batch(self.holder, [self.copy])
+        self.assertEqual(response.status_code, 409)
+        self.assert_hold_untouched()
+
+
+# ---------------------------------------------------------------------------
+# C5 — a batch return is for ONE member
+# ---------------------------------------------------------------------------
+
+class BatchReturnOneMemberTests(TestCase):
+    def setUp(self):
+        self.library = make_library()
+        self.librarian = make_librarian(self.library)
+        self.book = make_book()
+        self.member_a = make_member(self.library)
+        self.member_b = make_member(self.library)
+        self.loan_a = make_loan(make_copy(self.library, self.book), self.member_a)
+        self.loan_a2 = make_loan(make_copy(self.library, self.book), self.member_a)
+        self.loan_b = make_loan(make_copy(self.library, self.book), self.member_b)
+
+    def batch_return(self, *loans):
+        from apps.borrow_transactions.views import BorrowBatchReturnView
+        return _call(
+            BorrowBatchReturnView, "post", self.librarian,
+            {"transactions": [{"id": str(loan.pk)} for loan in loans]},
+        )
+
+    def test_one_members_stack_is_returned(self):
+        response = self.batch_return(self.loan_a, self.loan_a2)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            BorrowTransaction.objects.filter(member=self.member_a, returned_at__isnull=False).count(), 2
+        )
+
+    def test_mixed_members_are_rejected_and_nothing_changes(self):
+        response = self.batch_return(self.loan_a, self.loan_b)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(len(response.data["errors"]), 2)
+        for loan in (self.loan_a, self.loan_b):
+            loan.refresh_from_db()
+            self.assertIsNone(loan.returned_at)
+            loan.book_copy.refresh_from_db()
+            self.assertEqual(loan.book_copy.status, BookCopy.STATUS_BORROWED)
+
+    def test_return_email_task_sends_each_member_only_their_own_books(self):
+        from unittest import mock
+        from apps.notifications import tasks
+        for loan in (self.loan_a, self.loan_b):
+            loan.returned_at = timezone.now()
+            loan.save(update_fields=["returned_at"])
+        with mock.patch.object(tasks, "_send_email") as send:
+            tasks.send_return_email.apply(args=[[str(self.loan_a.pk), str(self.loan_b.pk)]])
+        sent = {c.kwargs["to_email"]: c.kwargs["context"]["books"] for c in send.call_args_list}
+        self.assertEqual(set(sent), {self.member_a.email, self.member_b.email})
+        self.assertEqual([b["barcode"] for b in sent[self.member_a.email]], [self.loan_a.book_copy.barcode])
+        self.assertEqual([b["barcode"] for b in sent[self.member_b.email]], [self.loan_b.book_copy.barcode])
