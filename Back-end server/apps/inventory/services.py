@@ -38,6 +38,9 @@ from django.db import transaction
 from django.db.models import Count, Q
 
 from .models import Inventory
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def sync_inventory(library_id, book_id):
@@ -85,6 +88,37 @@ def sync_inventory(library_id, book_id):
         )
 
     return inventory
+
+def sync_inventory_pairs(pairs):
+    """
+    Syncs inventory for a set of (library_id, book_id) pairs, ONE AT A
+    TIME, in sorted order — and meant to be called AFTER the caller's
+    transaction.atomic() block has committed.
+
+    WHY AFTER THE COMMIT
+    --------------------
+    sync_inventory() locks the title's inventory row. Called from inside
+    a big atomic block (a checkout, a return, a 200-loan bulk update) the
+    row stays locked until the WHOLE block commits, so every other
+    checkout or return of the same title waits for it, and two requests
+    that touch the same two titles can deadlock. Called here, after the
+    commit, each sync is its own tiny transaction: the lock is held for a
+    few milliseconds and never together with another lock.
+
+    This is safe because sync_inventory() RECOMPUTES from book_copies
+    (see the module docstring) instead of adding a delta — running it a
+    moment after the commit gives the same answer.
+
+    If a sync fails (a database hiccup), the loan/return has ALREADY been
+    committed, so we must not turn that into a 500 for the client. The
+    error is logged, and the next sync of that title or the scheduled
+    reconcile_all_inventory() job repairs the counts.
+    """
+    for library_id, book_id in sorted(pairs, key=lambda pair: (str(pair[0]), str(pair[1]))):
+        try:
+            sync_inventory(library_id, book_id)
+        except Exception:
+            logger.exception("inventory sync failed for library=%s book=%s", library_id, book_id)
 
 
 def sync_inventory_for_copy(book_copy):

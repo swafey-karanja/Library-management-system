@@ -51,7 +51,7 @@ from .serializers import (
 from .notifications import notify_checkout, notify_return, notify_update, NOTIFIABLE_FIELDS
 from apps.reservations.models import Reservation
 from apps.reservations.services import assign_or_release_book_copy
-from apps.inventory.services import sync_inventory_many
+from apps.inventory.services import sync_inventory_many, sync_inventory_pairs
 from apps.book_copies.services import set_copy_status
 from rest_framework.exceptions import NotFound                       # next to the other rest_framework imports
 from .corrections import COPY_RELEASE, CorrectionError, plan_correction   # next to `from .models import BorrowTransaction`
@@ -75,7 +75,7 @@ class BorrowTransactionPagination(PageNumberPagination):
     max_page_size = 100
 
 
-def _apply_copy_action(book_copy, action):
+def _apply_copy_action(book_copy, action, touched):
     """
     Carries out the copy change that plan_correction() decided on (see
     corrections.py for the table of rules). `action` is None (leave the
@@ -86,15 +86,22 @@ def _apply_copy_action(book_copy, action):
     without a lock and with no check of what state the copy was in.
     Now the decision is made once, from the locked rows, in
     plan_correction(); this function only performs it.
+
+    `touched` is a set the caller keeps for the whole request. Every
+    (library, book) whose copy changed is added to it, and the caller
+    syncs inventory for them AFTER its transaction.atomic() block has
+    committed (sync_inventory_pairs) — never in here, where the
+    inventory row lock would be held until the whole block commits.
     """
     if action is None:
         return
+    touched.add((book_copy.library_id, book_copy.book_id))
     if action == COPY_RELEASE:
         # Gives the copy to the oldest waiting reservation, or puts it on
-        # the shelf. It syncs inventory itself (reservations/services.py).
-        assign_or_release_book_copy(book_copy)
+        # the shelf.
+        assign_or_release_book_copy(book_copy, sync=False)
     else:
-        set_copy_status(book_copy, action)
+        set_copy_status(book_copy, action, sync=False)
 
 
 # Fallback cap on active (not yet returned) loans a member may hold at
@@ -129,8 +136,73 @@ def _get_active_loan_limit(library):
 
 
 def _count_active_loans(member):
-    """How many not-yet-returned transactions this member currently has."""
-    return BorrowTransaction.objects.filter(member=member, returned_at__isnull=True).count()
+    """
+    How many loans this member currently has OUT: not returned, and not
+    lost. A loan logged as lost stops counting the moment it is logged
+    (it still has no returned_at, which is why returned_at alone is not
+    enough). The member now owes for the book, not holds it.
+    """
+    return (
+        BorrowTransaction.objects
+        .filter(member=member, returned_at__isnull=True)
+        .exclude(status=BorrowTransaction.STATUS_LOST)
+        .count()
+    )
+
+
+def _lock_member_and_check_limit(member, user, new_loans):
+    """
+    Locks the member's row, THEN re-checks the member and counts their
+    loans. Returns (fresh_member, None) when `new_loans` more loans fit,
+    or (None, error Response). Call it INSIDE transaction.atomic(), as
+    the first thing, before the book copies are locked.
+
+    WHY THE LOCK
+    ------------
+    The old code counted the member's loans before opening the
+    transaction. Two checkouts for the same member at the same moment
+    both counted "4 of 5", both passed, and the member ended up with 6.
+    There is no single loan row to lock for "how many does this member
+    have", so we lock the one row that IS shared by all of that member's
+    checkouts: the member row. The second request waits here, and when it
+    gets the lock it counts again and sees the first one's loan.
+
+    Details that matter:
+      - of=('self',) locks only the member row, not the library row that
+        select_related('library') also reads.
+      - no_key=True (FOR NO KEY UPDATE) does not block the loan INSERT's
+        own foreign-key check on this member row, so we don't deadlock
+        with ourselves. It is also the weaker lock.
+      - The member is re-read here, so a member deactivated a moment ago
+        is refused too (status is re-checked on the fresh row).
+      - Lock order everywhere is: member -> book copies -> reservations.
+    """
+    MemberModel = member.__class__
+    try:
+        fresh = (
+            MemberModel.objects.select_related('library')
+            .select_for_update(of=('self',), no_key=True)
+            .get(pk=member.pk)
+        )
+    except MemberModel.DoesNotExist:
+        return None, Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    member_error = _member_checkout_error(fresh, user)
+    if member_error is not None:
+        return None, member_error
+
+    active_loan_count = _count_active_loans(fresh)
+    loan_limit = _get_active_loan_limit(fresh.library)
+    if active_loan_count + new_loans > loan_limit:
+        if new_loans == 1:
+            detail = f'This member has reached their active loan limit ({loan_limit}).'
+        else:
+            detail = (
+                f'This member has {active_loan_count} active loan(s) and a limit of '
+                f'{loan_limit}. This request would add {new_loans} more, which exceeds the limit.'
+            )
+        return None, Response({'detail': detail}, status=status.HTTP_409_CONFLICT)
+    return fresh, None
 
 
 def _member_checkout_error(member, user):
@@ -352,6 +424,7 @@ class BorrowTransactionUpdateView(LibraryScopedQuerysetMixin, generics.UpdateAPI
         # Only the fields the request actually sent (a PATCH body, or a
         # PUT body minus the read-only fields).
         changes = dict(serializer.validated_data)
+        touched = set()   # (library, book) pairs whose inventory needs a sync
 
         with transaction.atomic():
             # of=('self', 'book_copy') locks the loan row and its copy
@@ -383,7 +456,10 @@ class BorrowTransactionUpdateView(LibraryScopedQuerysetMixin, generics.UpdateAPI
                     setattr(borrow_transaction, field_name, value)
                 # update_fields => the UPDATE names only these columns.
                 borrow_transaction.save(update_fields=list(plan.fields))
-            _apply_copy_action(borrow_transaction.book_copy, plan.copy_action)
+            _apply_copy_action(borrow_transaction.book_copy, plan.copy_action, touched)
+
+        # After the commit: inventory sync as its own short transaction.
+        sync_inventory_pairs(touched)
 
         after = {field: getattr(borrow_transaction, field) for field in NOTIFIABLE_FIELDS}
 
@@ -443,6 +519,7 @@ class BorrowTransactionBulkUpdateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         items_by_id = {item['id']: item for item in items}
+        touched = set()   # (library, book) pairs whose inventory needs a sync
 
         try:
             # atomic() = all-or-nothing. Raising inside it (CorrectionError
@@ -510,7 +587,7 @@ class BorrowTransactionBulkUpdateView(APIView):
                             setattr(loan, field_name, value)
                         # update_fields => only these columns are written.
                         loan.save(update_fields=list(plan.fields))
-                    _apply_copy_action(loan.book_copy, plan.copy_action)
+                    _apply_copy_action(loan.book_copy, plan.copy_action, touched)
 
                     after = {field: getattr(loan, field) for field in NOTIFIABLE_FIELDS}
                     notify_update(loan.id, before, after)   # sent only if the whole batch commits
@@ -519,6 +596,10 @@ class BorrowTransactionBulkUpdateView(APIView):
                 {'detail': exc.detail, 'id': str(exc.loan_id)},
                 status=exc.status_code,
             )
+
+        # The batch has committed. Sync each touched title once, in sorted
+        # order, each as its own short transaction.
+        sync_inventory_pairs(touched)
 
         # Respond in the order the client sent the items, not our sorted order.
         response_serializer = BorrowTransactionSerializer(
@@ -551,22 +632,15 @@ class BorrowCheckoutView(APIView):
         if member_error is not None:
             return member_error
 
-        # Loan-limit check. Deliberately a plain count, not locked with
-        # select_for_update — a member's "how many books do I have out"
-        # isn't a single row we can lock the way a specific BookCopy
-        # is below, so two simultaneous checkouts for the same member
-        # could in rare cases both pass this check. Low-stakes enough
-        # (unlike double-lending one physical copy) to accept as a
-        # best-effort check rather than adding lock complexity for it.
-        active_loan_count = _count_active_loans(member)
-        loan_limit = _get_active_loan_limit(member.library)
-        if active_loan_count + 1 > loan_limit:
-            return Response(
-                {'detail': f'This member has reached their active loan limit ({loan_limit}).'},
-                status=status.HTTP_409_CONFLICT,
-            )
+        touched = set()   # (library, book) pairs whose inventory needs a sync
 
         with transaction.atomic():
+            # Lock the member and check their loan limit FIRST (see
+            # _lock_member_and_check_limit for why it is locked).
+            member, limit_error = _lock_member_and_check_limit(member, request.user, 1)
+            if limit_error is not None:
+                return limit_error
+
             # SCOPING: BorrowCheckoutSerializer's own queryset for
             # `book_copy` is unscoped (any library's copy passes that
             # first check) — this re-fetch is the real gate. Scoped +
@@ -605,11 +679,16 @@ class BorrowCheckoutView(APIView):
             )
             borrow_transaction.save()
 
-            set_copy_status(book_copy, book_copy.STATUS_BORROWED)
+            # sync=False: inventory is synced AFTER the commit (below), so
+            # its row lock isn't held for the rest of this transaction.
+            set_copy_status(book_copy, book_copy.STATUS_BORROWED, sync=False)
+            touched.add((book_copy.library_id, book_copy.book_id))
 
             _close_holds(hold_ids)   # a picked-up hold becomes checked_out
 
             notify_checkout([borrow_transaction.id])
+
+        sync_inventory_pairs(touched)
 
         output_serializer = BorrowTransactionSerializer(borrow_transaction)
         return Response(output_serializer.data, status=status.HTTP_201_CREATED)
@@ -649,27 +728,14 @@ class BorrowBatchCheckoutView(APIView):
         if member_error is not None:
             return member_error
 
-        # Loan-limit check: existing active loans PLUS everything in
-        # THIS batch, since a member could otherwise check out several
-        # books in one request and blow past their limit in one shot,
-        # even though each individual request "looked" under the cap.
-        # Same best-effort reasoning as the single-checkout view — see
-        # comment there.
-        active_loan_count = _count_active_loans(member)
-        loan_limit = _get_active_loan_limit(member.library)
-        if active_loan_count + len(book_copy_ids) > loan_limit:
-            return Response(
-                {
-                    'detail': (
-                        f'This member has {active_loan_count} active loan(s) and a limit of '
-                        f'{loan_limit}. This request would add {len(book_copy_ids)} more, '
-                        f'which exceeds the limit.'
-                    )
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
-
         with transaction.atomic():
+            # Lock the member and check their loan limit FIRST. The limit
+            # counts existing loans PLUS everything in THIS batch (see
+            # _lock_member_and_check_limit).
+            member, limit_error = _lock_member_and_check_limit(member, request.user, len(book_copy_ids))
+            if limit_error is not None:
+                return limit_error
+
             # SCOPING: same reasoning as BorrowCheckoutView — the
             # serializer's own PrimaryKeyRelatedField queryset is
             # unscoped, so this is the real gate. A copy outside the
@@ -744,7 +810,9 @@ class BorrowBatchCheckoutView(APIView):
             touched_pairs = {
                 (copy.library_id, copy.book_id) for copy in locked_copies
             }
-            sync_inventory_many(touched_pairs)
+
+        # After the commit, sorted, one short transaction per title.
+        sync_inventory_pairs(touched_pairs)
 
         notify_checkout([txn.id for txn in created_transactions])
 
@@ -791,6 +859,8 @@ class BorrowReturnView(APIView):
         input_serializer = BorrowReturnSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         data = input_serializer.validated_data
+
+        touched = set()   # (library, book) pairs whose inventory needs a sync
 
         with transaction.atomic():
             # STEP 2 — fetch AND lock the loan together with its copy,
@@ -849,13 +919,14 @@ class BorrowReturnView(APIView):
                 book_copy.condition = condition
                 book_copy.save(update_fields=['condition'])
 
+            touched.add((book_copy.library_id, book_copy.book_id))
             if condition == book_copy.CONDITION_DAMAGED:
-                set_copy_status(book_copy, book_copy.STATUS_DAMAGED)
+                set_copy_status(book_copy, book_copy.STATUS_DAMAGED, sync=False)
             else:
                 # Never call assign_or_release_book_copy for a damaged
                 # copy — only reaches here when it's genuinely returnable.
-                # It syncs inventory itself (see reservations/services.py).
-                assign_or_release_book_copy(book_copy)
+                # sync=False: inventory is synced after the commit (below).
+                assign_or_release_book_copy(book_copy, sync=False)
 
             # NOTE: there used to be a final
             #     book_copy.save(update_fields=['status', 'condition'])
@@ -865,6 +936,7 @@ class BorrowReturnView(APIView):
             # row that had been read earlier — a way to silently overwrite
             # a concurrent change. Removed.
 
+        sync_inventory_pairs(touched)
         notify_return([borrow_transaction.id])
 
         output_serializer = BorrowTransactionSerializer(borrow_transaction)
@@ -895,6 +967,8 @@ class BorrowBatchReturnView(APIView):
         items = data['transactions']
         shared_returned_at = data.get('returned_at')
         requested_ids = [item['id'] for item in items]
+
+        touched = set()   # (library, book) pairs whose inventory needs a sync
 
         with transaction.atomic():
             # select_for_update + select_related locks BOTH the
@@ -970,15 +1044,19 @@ class BorrowBatchReturnView(APIView):
                     book_copy.condition = condition
                     book_copy.save(update_fields=['condition'])
 
+                touched.add((book_copy.library_id, book_copy.book_id))
                 if condition == book_copy.CONDITION_DAMAGED:
-                    set_copy_status(book_copy, book_copy.STATUS_DAMAGED)
+                    set_copy_status(book_copy, book_copy.STATUS_DAMAGED, sync=False)
                 else:
-                    # Syncs inventory itself (see reservations/services.py).
-                    assign_or_release_book_copy(book_copy)
-                book_copy.save(update_fields=['status', 'condition'])
+                    assign_or_release_book_copy(book_copy, sync=False)
+                # (A final book_copy.save(update_fields=['status','condition'])
+                # used to be here. Removed for the same reason as in
+                # BorrowReturnView: it re-wrote two columns from an
+                # in-memory copy and could undo a concurrent change.)
 
                 returned_transactions.append(borrow_transaction)
 
+        sync_inventory_pairs(touched)
         notify_return([txn.id for txn in returned_transactions])
 
         output_serializer = BorrowTransactionSerializer(returned_transactions, many=True)

@@ -838,3 +838,224 @@ class BatchReturnOneMemberTests(TestCase):
         self.assertEqual(set(sent), {self.member_a.email, self.member_b.email})
         self.assertEqual([b["barcode"] for b in sent[self.member_a.email]], [self.loan_a.book_copy.barcode])
         self.assertEqual([b["barcode"] for b in sent[self.member_b.email]], [self.loan_b.book_copy.barcode])
+
+
+# ---------------------------------------------------------------------------
+# H1 / H2 / H3 — inventory sync timing, lock scope, stranded reservations
+# ---------------------------------------------------------------------------
+
+class InventorySyncAfterCommitTests(TestCase):
+    """
+    The inventory row must be synced AFTER the view's atomic block, not
+    inside it (otherwise its lock is held until the whole block commits).
+    Inside a TestCase everything is already in one transaction, so we
+    detect "inside the view's atomic block" by the savepoint depth.
+    """
+
+    def setUp(self):
+        self.library = make_library()
+        self.librarian = make_librarian(self.library)
+        self.member = make_member(self.library)
+        self.book = make_book()
+        self.book2 = make_book()
+
+    def record_sync_depths(self, call):
+        from unittest import mock
+        from apps.inventory import services as inv
+        baseline = len(connection.savepoint_ids)
+        depths, order = [], []
+        real = inv.sync_inventory
+
+        def spy(library_id, book_id):
+            depths.append(len(connection.savepoint_ids) - baseline)
+            order.append((str(library_id), str(book_id)))
+            return real(library_id, book_id)
+
+        with mock.patch.object(inv, "sync_inventory", spy):
+            response = call()
+        return response, depths, order
+
+    def test_checkout_syncs_after_the_block(self):
+        copy = make_copy(self.library, self.book, status=BookCopy.STATUS_AVAILABLE)
+        response, depths, _ = self.record_sync_depths(lambda: _call(
+            BorrowCheckoutView, "post", self.librarian,
+            {"book_copy": str(copy.pk), "member": str(self.member.pk)}))
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(depths and all(d == 0 for d in depths), depths)
+
+    def test_return_syncs_after_the_block(self):
+        loan = make_loan(make_copy(self.library, self.book), self.member)
+        response, depths, _ = self.record_sync_depths(lambda: _call(
+            BorrowReturnView, "post", self.librarian, {}, pk=loan.pk))
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(depths and all(d == 0 for d in depths), depths)
+
+    def test_batch_return_syncs_after_the_block_in_sorted_order(self):
+        from apps.borrow_transactions.views import BorrowBatchReturnView
+        loans = [make_loan(make_copy(self.library, b), self.member) for b in (self.book, self.book2, self.book)]
+        response, depths, order = self.record_sync_depths(lambda: _call(
+            BorrowBatchReturnView, "post", self.librarian,
+            {"transactions": [{"id": str(l.pk)} for l in loans]}))
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(all(d == 0 for d in depths), depths)
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(len(order), 2)          # one sync per distinct title
+
+    def test_batch_checkout_syncs_after_the_block_in_sorted_order(self):
+        copies = [make_copy(self.library, b, status=BookCopy.STATUS_AVAILABLE) for b in (self.book, self.book2)]
+        response, depths, order = self.record_sync_depths(lambda: _call(
+            BorrowBatchCheckoutView, "post", self.librarian,
+            {"member": str(self.member.pk), "book_copies": [str(c.pk) for c in copies]}))
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(all(d == 0 for d in depths), depths)
+        self.assertEqual(order, sorted(order))
+
+    def test_inventory_counts_are_still_right(self):
+        loan = make_loan(make_copy(self.library, self.book), self.member)
+        _call(BorrowReturnView, "post", self.librarian, {}, pk=loan.pk)
+        inv = Inventory.objects.get(library=self.library, book=self.book)
+        self.assertEqual((inv.total_copies, inv.available_copies, inv.borrowed_copies), (1, 1, 0))
+
+
+class ReturnReservationLockScopeTests(TestCase):
+    """H2: handing a returned copy to a waiter must lock only the reservation row."""
+
+    def test_only_the_reservation_row_is_locked(self):
+        library = make_library(); librarian = make_librarian(library)
+        book, member = make_book(), make_member(library)
+        waiter = make_member(library)
+        make_waiting_reservation(library, book, waiter)
+        loan = make_loan(make_copy(library, book), member)
+        with CaptureQueriesContext(connection) as ctx:
+            response = _call(BorrowReturnView, "post", librarian, {}, pk=loan.pk)
+        self.assertEqual(response.status_code, 200, response.data)
+        locks = [q for q in _sql(ctx) if 'FROM "reservations"' in q and "FOR NO KEY UPDATE" in q]
+        self.assertEqual(len(locks), 1)
+        self.assertIn('OF "reservations"', locks[0])
+        self.assertNotIn('JOIN', locks[0])
+
+
+class StrandedReservationTests(TestCase):
+    """H3: a waiting reservation and an available copy must never be left side by side."""
+
+    def setUp(self):
+        self.library = make_library()
+        self.book = make_book()
+        self.member = make_member(self.library)
+
+    def test_fulfil_waiting_matches_oldest_first_and_syncs_inventory(self):
+        from apps.reservations.services import fulfil_waiting
+        old = make_waiting_reservation(self.library, self.book, self.member, minutes_ago=30)
+        new = make_waiting_reservation(self.library, self.book, make_member(self.library), minutes_ago=5)
+        copy = make_copy(self.library, self.book, status=BookCopy.STATUS_AVAILABLE)
+        self.assertEqual(fulfil_waiting(self.library.pk, self.book.pk), 1)
+        old.refresh_from_db(); new.refresh_from_db(); copy.refresh_from_db()
+        self.assertEqual((old.status, old.book_copy_id), (Reservation.STATUS_RESERVED, copy.pk))
+        self.assertEqual(new.status, Reservation.STATUS_WAITING)
+        self.assertEqual(copy.status, BookCopy.STATUS_RESERVED)
+        self.assertIsNotNone(old.expires_at)
+        inv = Inventory.objects.get(library=self.library, book=self.book)
+        self.assertEqual((inv.available_copies, inv.reserved_copies), (0, 1))
+
+    def test_fulfil_waiting_with_nothing_to_match_does_nothing(self):
+        from apps.reservations.services import fulfil_waiting
+        make_copy(self.library, self.book, status=BookCopy.STATUS_AVAILABLE)
+        self.assertEqual(fulfil_waiting(self.library.pk, self.book.pk), 0)
+
+    def test_reservation_created_just_after_a_copy_freed_up_is_rescued(self):
+        """Simulates the race: create_reservation's availability check was stale."""
+        from unittest import mock
+        from apps.reservations import services
+        copy = make_copy(self.library, self.book, status=BookCopy.STATUS_AVAILABLE)
+        with mock.patch.object(services, "claim_available_copy", return_value=None), \
+             mock.patch("apps.reservations.notifications.send_reservation_created_email.delay"), \
+             mock.patch("apps.reservations.notifications.send_reservation_ready_email.delay"), \
+             self.captureOnCommitCallbacks(execute=True):
+            reservation = services.create_reservation(self.library, self.book, self.member)
+        reservation.refresh_from_db(); copy.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.STATUS_RESERVED)
+        self.assertEqual(copy.status, BookCopy.STATUS_RESERVED)
+
+    def test_return_registers_the_safety_pass_after_commit(self):
+        """Simulates the race from the return side: the waiter was invisible at return time."""
+        from unittest import mock
+        librarian = make_librarian(self.library)
+        loan = make_loan(make_copy(self.library, self.book), self.member)
+        with mock.patch("apps.borrow_transactions.notifications.send_return_email.delay"), \
+             self.captureOnCommitCallbacks(execute=False) as callbacks:
+            _call(BorrowReturnView, "post", librarian, {}, pk=loan.pk)
+        # A reservation that "committed meanwhile":
+        waiter = make_waiting_reservation(self.library, self.book, make_member(self.library))
+        with mock.patch("apps.reservations.notifications.send_reservation_ready_email.delay"), \
+             mock.patch("apps.borrow_transactions.notifications.send_return_email.delay"):
+            for cb in callbacks:
+                cb()
+        waiter.refresh_from_db()
+        self.assertEqual(waiter.status, Reservation.STATUS_RESERVED)
+
+
+# ---------------------------------------------------------------------------
+# H4 — the loan limit: counted under a member lock, lost loans don't count
+# ---------------------------------------------------------------------------
+
+class LoanLimitTests(TestCase):
+    def setUp(self):
+        self.library = make_library()
+        Library.objects.filter(pk=self.library.pk).update(enabled_modules={"max_active_loans": 2})
+        self.library.refresh_from_db()
+        self.librarian = make_librarian(self.library)
+        self.member = make_member(self.library)
+        self.book = make_book()
+
+    def shelf_copy(self):
+        return make_copy(self.library, self.book, status=BookCopy.STATUS_AVAILABLE)
+
+    def checkout(self, copy):
+        return _call(BorrowCheckoutView, "post", self.librarian,
+                     {"book_copy": str(copy.pk), "member": str(self.member.pk)})
+
+    def test_limit_is_enforced_for_single_checkout(self):
+        for _ in range(2):
+            self.assertEqual(self.checkout(self.shelf_copy()).status_code, 201)
+        response = self.checkout(self.shelf_copy())
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("limit", response.data["detail"])
+
+    def test_limit_counts_the_whole_batch(self):
+        copies = [self.shelf_copy() for _ in range(3)]
+        response = _call(BorrowBatchCheckoutView, "post", self.librarian,
+                         {"member": str(self.member.pk), "book_copies": [str(c.pk) for c in copies]})
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(BorrowTransaction.objects.filter(member=self.member).exists())
+
+    def test_a_lost_loan_does_not_count_towards_the_limit(self):
+        lost = make_loan(make_copy(self.library, self.book, status=BookCopy.STATUS_LOST), self.member)
+        BorrowTransaction.objects.filter(pk=lost.pk).update(status=BorrowTransaction.STATUS_LOST)
+        make_loan(make_copy(self.library, self.book), self.member)           # 1 genuinely active
+        self.assertEqual(self.checkout(self.shelf_copy()).status_code, 201)  # 2nd active: allowed
+        self.assertEqual(self.checkout(self.shelf_copy()).status_code, 409)  # 3rd: refused
+
+    def test_marking_a_loan_lost_frees_a_slot_immediately(self):
+        loans = [make_loan(make_copy(self.library, self.book), self.member) for _ in range(2)]
+        self.assertEqual(self.checkout(self.shelf_copy()).status_code, 409)
+        BorrowTransaction.objects.filter(pk=loans[0].pk).update(status=BorrowTransaction.STATUS_LOST)
+        self.assertEqual(self.checkout(self.shelf_copy()).status_code, 201)
+
+    def test_member_row_is_locked_while_counting(self):
+        copy = self.shelf_copy()
+        with CaptureQueriesContext(connection) as ctx:
+            self.assertEqual(self.checkout(copy).status_code, 201)
+        statements = _sql(ctx)
+        lock_at = next(i for i, q in enumerate(statements)
+                       if 'FROM "members"' in q and "FOR NO KEY UPDATE" in q)
+        count_at = next(i for i, q in enumerate(statements) if "COUNT(" in q and "borrow_transactions" in q)
+        self.assertLess(lock_at, count_at, "the member must be locked BEFORE the loans are counted")
+        self.assertIn('OF "members"', statements[lock_at])   # never lock the library row too
+
+    def test_batch_also_locks_the_member_first(self):
+        copy = self.shelf_copy()
+        with CaptureQueriesContext(connection) as ctx:
+            response = _call(BorrowBatchCheckoutView, "post", self.librarian,
+                             {"member": str(self.member.pk), "book_copies": [str(copy.pk)]})
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue([q for q in _sql(ctx) if 'FROM "members"' in q and "FOR NO KEY UPDATE" in q])
